@@ -2,6 +2,19 @@ import CoreBluetooth
 import CoreMotion
 import Combine
 
+// MET values per HR zone (maxHR = 185 BPM). Used by both live (BLEManager) and historical (SyncManager).
+func metForHR(_ bpm: Int, maxHR: Double = 185) -> Double {
+    let pct = Double(bpm) / maxHR
+    switch pct {
+    case ..<0.50: return 0       // resting
+    case 0.50..<0.60: return 2.0 // Z1
+    case 0.60..<0.70: return 3.5 // Z2
+    case 0.70..<0.80: return 6.0 // Z3
+    case 0.80..<0.90: return 8.0 // Z4
+    default:          return 10.0 // Z5
+    }
+}
+
 private enum WUUID {
     static let service       = "61080001-8d6d-82b8-614a-1c8cb0f8dcc6"
     static let cmdTo         = "61080002"
@@ -53,6 +66,12 @@ final class BLEManager: NSObject, ObservableObject {
     // Rolling buffer of the last 60 valid RR intervals for RMSSD (§2.2)
     private var rrBuffer: [Double] = []
     private var hrvHistory: [Double] = []
+
+    // Active energy accumulator — flushed to HealthKit every 3 minutes (Move ring)
+    private var pendingEnergyKcal: Double = 0
+    private var activityWindowStart: Date = .distantPast
+    private var lastActivityFlush: Date = .distantPast
+    private let activityFlushInterval: TimeInterval = 180  // 3 minutes
 
     let healthKit      = HealthKitWriter()
     let syncManager    = SyncManager()
@@ -190,7 +209,37 @@ final class BLEManager: NSObject, ObservableObject {
         silenceWatchdog?.cancel(); silenceWatchdog = nil
     }
 
-    // Shared helper: update published metrics from any HR source.
+    // MARK: - Activity ring accumulation
+
+    private static let defaultWeightKg: Double = 70
+
+    private func accumulateActivity(_ metrics: WhoopMetrics) {
+        // Initialize window start on first sample after connection/flush
+        if activityWindowStart == .distantPast {
+            activityWindowStart = metrics.timestamp
+            lastActivityFlush   = metrics.timestamp
+        }
+
+        let durationHours = 1.0 / 3600.0  // assume ~1 sample/sec
+        let met = metForHR(metrics.heartRate)
+        pendingEnergyKcal += met * BLEManager.defaultWeightKg * durationHours
+
+        // Flush every 3 minutes
+        let elapsed = metrics.timestamp.timeIntervalSince(lastActivityFlush)
+        guard elapsed >= activityFlushInterval else { return }
+
+        let windowEnd = metrics.timestamp
+        let windowStart = activityWindowStart
+        let kcal = pendingEnergyKcal
+
+        pendingEnergyKcal = 0
+        activityWindowStart = windowEnd
+        lastActivityFlush = windowEnd
+
+        healthKit.writeActiveEnergy(kcal: kcal, start: windowStart, end: windowEnd)
+    }
+
+    // MARK: - Shared helper: update published metrics from any HR source.
     nonisolated private func acceptMetrics(_ metrics: WhoopMetrics) {
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -226,6 +275,7 @@ final class BLEManager: NSObject, ObservableObject {
                                      hrv: freshHRV)
 
             self.healthKit.write(metrics)
+            self.accumulateActivity(metrics)
             self.liveSleep.observe(metrics)
 
             // Feed raw stores for recompute pipeline
@@ -337,6 +387,9 @@ extension BLEManager: CBCentralManagerDelegate {
             smoothedHRV = nil
             batteryLevel = nil
             connectionState = .disconnected
+            pendingEnergyKcal = 0
+            activityWindowStart = .distantPast
+            lastActivityFlush = .distantPast
             startScanning()
         }
     }

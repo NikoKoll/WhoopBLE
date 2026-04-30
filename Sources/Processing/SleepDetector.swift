@@ -1,22 +1,30 @@
 import Foundation
 
-// Detects sleep sessions from historical samples using a rule-based heuristic.
-// Scores each 10-minute window on motion variance and HR; classifies as asleep/awake.
-// Session starts after 20 min continuous sleep; ends after 10 min continuous activity.
+// Detects sleep sessions from historical HR samples.
+// Uses a global resting HR baseline so REM spikes don't break sessions.
+// Sessions within 45 min of each other are merged into one.
 final class SleepDetector {
 
-    private let windowSize: TimeInterval         = 10 * 60  // 10-minute windows
-    private let sleepOnsetThreshold: TimeInterval = 20 * 60  // 20 min to confirm sleep start
-    private let wakeThreshold: TimeInterval       = 10 * 60  // 10 min to confirm wake
-
-    private let lowMotionVariance: Double = 0.05  // g² — below this = low motion
-    private let restingHRMargin: Double   = 5      // BPM above estimated resting HR
+    private let windowSize: TimeInterval          = 10 * 60   // 10-minute windows
+    private let sleepOnsetThreshold: TimeInterval = 20 * 60   // 2 consecutive sleep windows to confirm onset
+    private let wakeThreshold: TimeInterval       = 40 * 60   // 4 consecutive awake windows to end session
+    private let mergeGap: TimeInterval            = 45 * 60   // merge sessions closer than this
+    private let restingHRMargin: Double           = 15        // BPM above global resting HR = still sleep-like
 
     func process(_ samples: [HistoricalSample]) -> [SleepSession] {
         guard samples.count >= 2 else { return [] }
-        let windows = buildWindows(from: samples)
-        let states = windows.map { classify($0) }
-        return extractSessions(windows: windows, states: states)
+        let sorted = samples.sorted { $0.timestamp < $1.timestamp }
+
+        // Global resting HR: 10th-percentile of all HR values.
+        // More robust than per-window min — unaffected by brief REM spikes.
+        let allHR = sorted.map { Double($0.heartRate) }.sorted()
+        let p10idx = max(0, Int(Double(allHR.count) * 0.10) - 1)
+        let restingHR = allHR[p10idx]
+
+        let windows = buildWindows(from: sorted)
+        let states = windows.map { classify($0, restingHR: restingHR) }
+        let raw = extractSessions(windows: windows, states: states)
+        return mergeSessions(raw)
     }
 
     // MARK: - Window building
@@ -42,21 +50,15 @@ final class SleepDetector {
     }
 
     // MARK: - Window classification (true = asleep)
-    private func classify(_ window: Window) -> Bool {
-        let samples = window.samples
-        let hrs = samples.map { Double($0.heartRate) }
-        let minHR = hrs.min() ?? 60
+    private func classify(_ window: Window, restingHR: Double) -> Bool {
+        let hrs = window.samples.map { Double($0.heartRate) }
         let avgHR = hrs.reduce(0, +) / Double(hrs.count)
+        let hrSleepLike = avgHR < restingHR + restingHRMargin
 
-        let hrSleepLike = avgHR < minHR + restingHRMargin
-
-        if let motionVar = accelVariance(from: samples) {
-            // Both signals available — require both to agree.
-            return hrSleepLike && motionVar < lowMotionVariance
-        } else {
-            // Historical WHOOP batches carry no accelerometer — HR alone is the signal.
-            return hrSleepLike
+        if let motionVar = accelVariance(from: window.samples) {
+            return hrSleepLike && motionVar < 0.05
         }
+        return hrSleepLike
     }
 
     // MARK: - Session extraction
@@ -90,11 +92,27 @@ final class SleepDetector {
                 }
             }
         }
-        // Close any open sleep session at end of data
         if let start = sleepStart, let last = windows.last {
             sessions.append(SleepSession(start: start, end: last.end))
         }
         return sessions
+    }
+
+    // MARK: - Merge nearby sessions
+    private func mergeSessions(_ sessions: [SleepSession]) -> [SleepSession] {
+        guard sessions.count > 1 else { return sessions }
+        var merged: [SleepSession] = []
+        var current = sessions[0]
+        for next in sessions.dropFirst() {
+            if next.start.timeIntervalSince(current.end) <= mergeGap {
+                current = SleepSession(start: current.start, end: max(current.end, next.end))
+            } else {
+                merged.append(current)
+                current = next
+            }
+        }
+        merged.append(current)
+        return merged
     }
 
     // MARK: - Helpers

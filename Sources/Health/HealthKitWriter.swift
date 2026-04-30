@@ -11,6 +11,7 @@ final class HealthKitWriter {
             HKQuantityType(.heartRate),
             HKQuantityType(.heartRateVariabilitySDNN),
             HKQuantityType(.stepCount),
+            HKQuantityType(.activeEnergyBurned),
             HKCategoryType(.sleepAnalysis)
         ]
         let read: Set<HKObjectType> = [
@@ -75,6 +76,20 @@ final class HealthKitWriter {
         }
     }
 
+    // MARK: - Active Energy (Move ring)
+    func writeActiveEnergy(kcal: Double, start: Date, end: Date) {
+        guard kcal > 0, end > start else { return }
+        let qty = HKQuantity(unit: .kilocalorie(), doubleValue: kcal)
+        let sample = HKQuantitySample(type: HKQuantityType(.activeEnergyBurned), quantity: qty,
+                                      start: start, end: end)
+        store.save(sample) { @Sendable _, error in
+            if let error { print("[HK] Energy write error: \(error.localizedDescription)") }
+            else { print("[HK] Energy written: \(String(format: "%.1f", kcal)) kcal (\(start) → \(end))") }
+        }
+    }
+
+    // appleExerciseTime is read-only (Apple Watch exclusive) — cannot be written by third-party apps.
+
     // MARK: - Delete sleep entries written by this app
     func deleteSleepSamples() {
         let type = HKCategoryType(.sleepAnalysis)
@@ -96,11 +111,19 @@ final class HealthKitWriter {
     // MARK: - Sleep analysis
     func writeSleep(_ sessions: [SleepSession]) {
         guard !sessions.isEmpty else { return }
-        let samples: [HKSample] = sessions.map {
-            HKCategorySample(
+        let maxSleepDuration: TimeInterval = 86400  // HealthKit cap: 24h
+        let now = Date()
+        let samples: [HKSample] = sessions.compactMap {
+            let start = $0.start
+            let end   = min($0.end, start.addingTimeInterval(maxSleepDuration))
+            guard end > start, end <= now.addingTimeInterval(3600) else {
+                print("[HealthKit] sleep session skipped: invalid range \(start) → \(end)")
+                return nil
+            }
+            return HKCategorySample(
                 type: HKCategoryType(.sleepAnalysis),
                 value: HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
-                start: $0.start, end: $0.end
+                start: start, end: end
             )
         }
         store.save(samples) { @Sendable _, error in

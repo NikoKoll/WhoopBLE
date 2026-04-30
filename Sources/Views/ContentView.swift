@@ -2,6 +2,8 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var ble: BLEManager
+    @State private var trackedDay: Date = Calendar.current.startOfDay(for: Date())
+    private let dayCheckTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     var body: some View {
         TabView {
@@ -30,6 +32,13 @@ struct ContentView: View {
         }
         .tint(.cyan)
         .onAppear { applyDarkTabBar() }
+        .onReceive(dayCheckTimer) { _ in
+            let newDay = Calendar.current.startOfDay(for: Date())
+            if newDay != trackedDay {
+                trackedDay = newDay
+                ble.refreshPedometer()
+            }
+        }
     }
 
     private func applyDarkTabBar() {

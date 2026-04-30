@@ -3,7 +3,7 @@ import Charts
 
 struct TrendsView: View {
     @ObservedObject var store: MetricsStore
-    /// Live CMPedometer step count from BLEManager — always reflects today, never inflated by batch sync.
+    /// Live CMPedometer step count — always today, never inflated by batch sync.
     var liveSteps: Int
 
     @State private var range: TrendRange = .today
@@ -17,8 +17,7 @@ struct TrendsView: View {
     // MARK: - Derived windows
 
     private var tomorrow: Date { cal.date(byAdding: .day, value: 1, to: today) ?? today }
-    // Extra padding on right so today's bar isn't clipped at its right edge
-    private var weekEnd: Date { cal.date(byAdding: .day, value: 2, to: today) ?? tomorrow }
+    private var weekEnd:  Date { cal.date(byAdding: .day, value: 1, to: today) ?? tomorrow }
     private var weekStart: Date { cal.date(byAdding: .day, value: -6, to: today) ?? today }
 
     private var todayEntries: [MetricsStore.Entry] {
@@ -31,14 +30,10 @@ struct TrendsView: View {
 
     private var weekSteps: [MetricsStore.DailySteps] {
         var steps = store.dailySteps.filter { $0.id >= weekStart && $0.id <= today }
-        // Replace today's stored count with live CMPedometer value so the bar reflects
-        // real-time steps, not whatever batch sync may have written for today's key.
-        if liveSteps > 0 {
-            if let idx = steps.firstIndex(where: { $0.id == today }) {
-                steps[idx].steps = liveSteps
-            } else {
-                steps.append(MetricsStore.DailySteps(id: today, steps: liveSteps))
-            }
+        // Only override an existing stored entry — never insert new today entry with
+        // potentially stale liveSteps (CMPedometer may lag behind midnight reset).
+        if liveSteps > 0, let idx = steps.firstIndex(where: { $0.id == today }) {
+            steps[idx].steps = liveSteps
         }
         return steps
     }
@@ -54,12 +49,19 @@ struct TrendsView: View {
                         ForEach(TrendRange.allCases, id: \.self) { Text($0.rawValue) }
                     }
                     .pickerStyle(.segmented)
-                    .colorScheme(.dark)
+                    .environment(\.colorScheme, .dark)
                     .padding(.horizontal)
 
-                    if range == .today { todayView } else { weekView }
+                    if range == .today {
+                        todayView
+                            .transition(.opacity.combined(with: .move(edge: .leading)))
+                    } else {
+                        weekView
+                            .transition(.opacity.combined(with: .move(edge: .trailing)))
+                    }
                 }
                 .padding(.vertical)
+                .animation(.easeInOut(duration: 0.22), value: range)
             }
         }
         .navigationTitle("Trends")
@@ -74,50 +76,60 @@ struct TrendsView: View {
 
     private var todayView: some View {
         let entries = todayEntries
-        let hrvE    = entries.filter { $0.hrv != nil }
+        let hrvEntries = entries.compactMap { e -> (entry: MetricsStore.Entry, hrv: Double)? in
+            guard let hrv = e.hrv else { return nil }
+            return (e, hrv)
+        }
         return VStack(spacing: 16) {
-            // Steps tile — liveSteps comes from CMPedometer via BLEManager, never from batch sync
+            // Steps tile
             card {
-                VStack(spacing: 4) {
-                    label("STEPS TODAY")
-                    HStack(spacing: 8) {
-                        Image(systemName: "figure.walk")
-                            .font(.title2)
-                            .foregroundStyle(liveSteps > 0 ? .purple : .purple.opacity(0.3))
+                HStack(spacing: 14) {
+                    Image(systemName: "figure.walk")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundStyle(liveSteps > 0 ? .purple : .purple.opacity(0.3))
+                        .frame(width: 36)
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(liveSteps > 0 ? liveSteps.formatted() : "—")
-                            .font(.system(size: 40, weight: .bold, design: .rounded))
-                            .foregroundStyle(liveSteps > 0 ? .white : .white.opacity(0.3))
+                            .font(.system(size: 36, weight: .bold, design: .rounded))
+                            .foregroundStyle(liveSteps > 0 ? .white : .white.opacity(0.35))
+                            .contentTransition(.numericText())
+                            .animation(.easeInOut(duration: 0.3), value: liveSteps)
+                        label("STEPS TODAY")
                     }
+                    Spacer()
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
+                .padding(.vertical, 4)
             }
 
-            // HR chart — anchored midnight → midnight so empty morning slots show
+            // HR chart
             card {
                 VStack(alignment: .leading, spacing: 10) {
                     label("HEART RATE — TODAY")
                     if entries.count >= 2 {
                         Chart(entries) { e in
-                            AreaMark(x: .value("t", e.timestamp),
+                            AreaMark(x: .value("Time", e.timestamp),
                                      y: .value("HR", e.heartRate))
                                 .foregroundStyle(.linearGradient(
-                                    colors: [.cyan.opacity(0.35), .clear],
+                                    colors: [.cyan.opacity(0.3), .clear],
                                     startPoint: .top, endPoint: .bottom))
-                            LineMark(x: .value("t", e.timestamp),
+                                .interpolationMethod(.monotone)
+                            LineMark(x: .value("Time", e.timestamp),
                                      y: .value("HR", e.heartRate))
                                 .foregroundStyle(.cyan)
                                 .lineStyle(StrokeStyle(lineWidth: 2))
+                                .interpolationMethod(.monotone)
                         }
                         .chartXScale(domain: today...tomorrow)
                         .chartYScale(domain: hrDomain(entries.map(\.heartRate)))
                         .chartXAxis { todayHourAxis }
                         .chartYAxis { hrYAxis }
+                        .chartLegend(.hidden)
                         .chartBackground { _ in Color.clear }
                         .chartPlotStyle { $0.background(Color.clear) }
                         .frame(height: 150)
+                        .accessibilityLabel("Heart rate chart for today")
                     } else {
-                        empty(height: 150)
+                        emptyState(icon: "heart", height: 150)
                     }
                 }
             }
@@ -126,25 +138,28 @@ struct TrendsView: View {
             card {
                 VStack(alignment: .leading, spacing: 10) {
                     label("HRV RMSSD — TODAY")
-                    if hrvE.count >= 2 {
-                        Chart(hrvE) { e in
-                            LineMark(x: .value("t", e.timestamp),
-                                     y: .value("HRV", e.hrv!))
+                    if hrvEntries.count >= 2 {
+                        Chart(hrvEntries, id: \.entry.id) { item in
+                            LineMark(x: .value("Time", item.entry.timestamp),
+                                     y: .value("HRV", item.hrv))
                                 .foregroundStyle(.purple)
                                 .lineStyle(StrokeStyle(lineWidth: 2))
-                            PointMark(x: .value("t", e.timestamp),
-                                      y: .value("HRV", e.hrv!))
+                                .interpolationMethod(.monotone)
+                            PointMark(x: .value("Time", item.entry.timestamp),
+                                      y: .value("HRV", item.hrv))
                                 .foregroundStyle(.purple)
-                                .symbolSize(16)
+                                .symbolSize(20)
                         }
                         .chartXScale(domain: today...tomorrow)
                         .chartXAxis { todayHourAxis }
                         .chartYAxis { hrvYAxis }
+                        .chartLegend(.hidden)
                         .chartBackground { _ in Color.clear }
                         .chartPlotStyle { $0.background(Color.clear) }
                         .frame(height: 110)
+                        .accessibilityLabel("HRV chart for today")
                     } else {
-                        empty(height: 110)
+                        emptyState(icon: "waveform.path.ecg", height: 110)
                     }
                 }
             }
@@ -157,7 +172,6 @@ struct TrendsView: View {
         let hrS   = weekSummaries.filter { $0.avgHR > 0 }
         let hrvS  = weekSummaries.filter { $0.avgHRV != nil }
         let stepS = weekSteps
-        // Domain: weekStart → weekEnd (2 days past today) so today's bars aren't clipped
         let xDomain = weekStart...weekEnd
 
         return VStack(spacing: 16) {
@@ -171,21 +185,28 @@ struct TrendsView: View {
                                     y: .value("HR", s.avgHR))
                                 .foregroundStyle(zoneColor(s.avgHR).gradient)
                                 .cornerRadius(4)
+                                .annotation(position: .bottom, alignment: .center, spacing: 4) {
+                                    Text(s.id, format: .dateTime.weekday(.abbreviated))
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.gray)
+                                }
                         }
                         .chartXScale(domain: xDomain)
                         .chartYScale(domain: hrDomain(hrS.map(\.avgHR)))
-                        .chartXAxis { weekDayAxis(for: hrS.map(\.id)) }
+                        .chartXAxis(.hidden)
                         .chartYAxis { hrYAxis }
+                        .chartLegend(.hidden)
                         .chartBackground { _ in Color.clear }
                         .chartPlotStyle { $0.background(Color.clear) }
-                        .frame(height: 150)
+                        .frame(height: 165)
+                        .accessibilityLabel("Daily average heart rate for the past 7 days")
                     } else {
-                        empty(height: 150)
+                        emptyState(icon: "heart", height: 150)
                     }
                 }
             }
 
-            // HRV line
+            // HRV area + line chart
             card {
                 VStack(alignment: .leading, spacing: 10) {
                     label("DAILY AVG HRV")
@@ -194,25 +215,29 @@ struct TrendsView: View {
                             AreaMark(x: .value("Day", s.id, unit: .day),
                                      y: .value("HRV", s.avgHRV!))
                                 .foregroundStyle(.linearGradient(
-                                    colors: [.purple.opacity(0.35), .clear],
+                                    colors: [.purple.opacity(0.3), .clear],
                                     startPoint: .top, endPoint: .bottom))
+                                .interpolationMethod(.monotone)
                             LineMark(x: .value("Day", s.id, unit: .day),
                                      y: .value("HRV", s.avgHRV!))
                                 .foregroundStyle(.purple)
                                 .lineStyle(StrokeStyle(lineWidth: 2))
+                                .interpolationMethod(.monotone)
                             PointMark(x: .value("Day", s.id, unit: .day),
                                       y: .value("HRV", s.avgHRV!))
                                 .foregroundStyle(.purple)
-                                .symbolSize(24)
+                                .symbolSize(20)
                         }
                         .chartXScale(domain: xDomain)
                         .chartXAxis { weekDayAxis(for: hrvS.map(\.id)) }
                         .chartYAxis { hrvYAxis }
+                        .chartLegend(.hidden)
                         .chartBackground { _ in Color.clear }
                         .chartPlotStyle { $0.background(Color.clear) }
                         .frame(height: 110)
+                        .accessibilityLabel("Daily average HRV for the past 7 days")
                     } else {
-                        empty(height: 110)
+                        emptyState(icon: "waveform.path.ecg", height: 110)
                     }
                 }
             }
@@ -227,20 +252,27 @@ struct TrendsView: View {
                                     y: .value("Steps", s.steps))
                                 .foregroundStyle(.purple.gradient)
                                 .cornerRadius(4)
+                                .annotation(position: .bottom, alignment: .center, spacing: 4) {
+                                    Text(s.id, format: .dateTime.weekday(.abbreviated))
+                                        .font(.system(size: 10, weight: .medium))
+                                        .foregroundStyle(.gray)
+                                }
                         }
                         .chartXScale(domain: xDomain)
-                        .chartXAxis { weekDayAxis(for: stepS.map(\.id)) }
+                        .chartXAxis(.hidden)
                         .chartYAxis {
                             AxisMarks(position: .trailing, values: .automatic(desiredCount: 4)) {
                                 AxisGridLine().foregroundStyle(Color.white.opacity(0.1))
                                 AxisValueLabel().foregroundStyle(Color.gray)
                             }
                         }
+                        .chartLegend(.hidden)
                         .chartBackground { _ in Color.clear }
                         .chartPlotStyle { $0.background(Color.clear) }
-                        .frame(height: 130)
+                        .frame(height: 145)
+                        .accessibilityLabel("Daily steps for the past 7 days")
                     } else {
-                        empty(height: 130)
+                        emptyState(icon: "figure.walk", height: 130)
                     }
                 }
             }
@@ -251,18 +283,18 @@ struct TrendsView: View {
         }
     }
 
-    // MARK: - Week summary
+    // MARK: - Week summary stats
 
     private func weekStats(hrS: [MetricsStore.DaySummary], stepS: [MetricsStore.DailySteps]) -> some View {
-        let avgHR      = hrS.isEmpty ? nil : hrS.map(\.avgHR).reduce(0, +) / hrS.count
-        let hrvVals    = hrS.compactMap(\.avgHRV)
-        let avgHRV     = hrvVals.isEmpty ? nil : hrvVals.reduce(0, +) / Double(hrvVals.count)
+        let avgHR: Double? = hrS.isEmpty ? nil : Double(hrS.map(\.avgHR).reduce(0, +)) / Double(hrS.count)
+        let hrvVals  = hrS.compactMap(\.avgHRV)
+        let avgHRV   = hrvVals.isEmpty ? nil : hrvVals.reduce(0, +) / Double(hrvVals.count)
         let totalSteps = stepS.map(\.steps).reduce(0, +)
 
         return card {
             HStack(spacing: 0) {
                 statCell("AVG HR",
-                         value: avgHR.map { "\($0) bpm" } ?? "—",
+                         value: avgHR.map { String(format: "%.0f bpm", $0) } ?? "—",
                          color: .cyan)
                 statDivider
                 statCell("AVG HRV",
@@ -276,14 +308,14 @@ struct TrendsView: View {
         }
     }
 
-    private func statCell(_ label: String, value: String, color: Color) -> some View {
+    private func statCell(_ title: String, value: String, color: Color) -> some View {
         VStack(spacing: 4) {
             Text(value)
                 .font(.system(size: 16, weight: .semibold, design: .rounded))
                 .foregroundStyle(color)
                 .minimumScaleFactor(0.7)
                 .lineLimit(1)
-            Text(label)
+            Text(title)
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(.gray)
                 .kerning(1.1)
@@ -301,27 +333,31 @@ struct TrendsView: View {
         content()
             .padding(16)
             .background(Color.white.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .clipShape(RoundedRectangle(cornerRadius: 16))
             .padding(.horizontal)
     }
 
     private func label(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 10, weight: .medium))
+            .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(.gray)
             .kerning(1.4)
     }
 
-    private func empty(height: CGFloat) -> some View {
-        Text("No data yet")
-            .font(.caption)
-            .foregroundStyle(Color.white.opacity(0.25))
-            .frame(maxWidth: .infinity, minHeight: height)
+    private func emptyState(icon: String, height: CGFloat) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 22, weight: .light))
+                .foregroundStyle(Color.white.opacity(0.15))
+            Text("No data yet")
+                .font(.caption)
+                .foregroundStyle(Color.white.opacity(0.2))
+        }
+        .frame(maxWidth: .infinity, minHeight: height)
     }
 
     // MARK: - Axis builders
 
-    // Today: 4-hour ticks
     private var todayHourAxis: some AxisContent {
         AxisMarks(values: .stride(by: .hour, count: 4)) {
             AxisGridLine().foregroundStyle(Color.white.opacity(0.1))
@@ -330,8 +366,6 @@ struct TrendsView: View {
         }
     }
 
-    // Marks placed at noon of each data day so labels center under their bars.
-    // Auto/stride marks land at midnight (bar left edge) → label drifts to the next bar.
     private func weekDayAxis(for days: [Date]) -> some AxisContent {
         AxisMarks(values: days.map { noonOf($0) }) { _ in
             AxisGridLine().foregroundStyle(Color.white.opacity(0.1))

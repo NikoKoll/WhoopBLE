@@ -45,10 +45,18 @@ actor RawDataStore {
     }
 
     /// Historical HR from batch sync — no 30 s throttle; all samples stored.
+    /// Deduplicates against in-memory buffer by timestamp (on-disk dedup handled at flush).
     func appendHRBatch(_ samples: [(timestamp: Int, bpm: Int)]) {
+        let bufferedTimestamps = Set(hrBuffer.map { $0.sample.timestamp })
+        var added = 0
         for s in samples {
             guard s.bpm >= 30, s.bpm <= 220 else { continue }
+            guard !bufferedTimestamps.contains(s.timestamp) else { continue }
             hrBuffer.append((isoDate(from: s.timestamp), HRSample(timestamp: s.timestamp, bpm: s.bpm)))
+            added += 1
+        }
+        if added < samples.count {
+            print("[Raw] appendHRBatch: \(added)/\(samples.count) added (\(samples.count - added) duplicate timestamps skipped)")
         }
     }
 

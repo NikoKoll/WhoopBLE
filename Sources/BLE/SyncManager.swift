@@ -22,6 +22,14 @@ final class SyncManager: ObservableObject {
     private var activeChunks: [Data] = []
     private var activeBatchTimestamp: Date?    // unix ts from batch ACK — anchors 0xa1 chunk timestamps
     private var processedBatches: Set<UInt32> = []
+    private var expectedBatchCount: Int = 0     // from 0xfc ACK data byte
+    private var lastReceivedBatchID: UInt32?    // for gap detection (IDs may not be sequential — log only)
+    private var batchIDGapCount: Int = 0
+    private var totalSamplesReceived: Int = 0
+    private var minBatchID: UInt32 = UInt32.max
+    private var maxBatchID: UInt32 = 0
+    private var receivedBatchIDs: [UInt32] = [] // insertion-ordered, for first/last 10 log
+    private var syncACKTime: Date? = nil        // when 0xfc ACK arrived, for first-batch delay measurement
     private var syncTimeoutTask: Task<Void, Never>?
     private var chunkIdleTask: Task<Void, Never>?
     // Offset to convert WHOOP internal clock to Unix epoch, derived from live DATA_FROM_STRAP packets.
@@ -48,6 +56,22 @@ final class SyncManager: ObservableObject {
         guard let ble = bleManager else { return }
         isSyncing = true
         syncBannerVisible = true
+        expectedBatchCount = 0
+        lastReceivedBatchID = nil
+        batchIDGapCount = 0
+        totalSamplesReceived = 0
+        minBatchID = UInt32.max
+        maxBatchID = 0
+        receivedBatchIDs = []
+        syncACKTime = nil
+        // Reset in-flight state from any prior session
+        batchQueue = []
+        activeBatchID = nil
+        activeChunks = []
+        activeBatchTimestamp = nil
+        accumulatedSamples = []
+        pendingBatchHR = []
+        chunkIdleTask?.cancel(); chunkIdleTask = nil
         ble.sendSyncCommand(WhoopCRC.syncTrigger)
         print("[SyncManager] trigger sent — waiting for batch acks")
 
@@ -123,27 +147,41 @@ final class SyncManager: ObservableObject {
 
         // Sync trigger ACK — strap reports how many batches are queued.
         guard cmdEcho == 0x16 else { return }
+        expectedBatchCount = Int(dataByte)
         print("[SyncManager] sync ACK: \(dataByte) batch(es) available on strap")
         guard dataByte > 0 else {
             print("[SyncManager] strap reports 0 batches — nothing to sync")
             return
         }
-        // Probe: send batchID=0 to ask strap to start streaming batch ACKs.
-        // batchID=0 is a guess based on WHOOP RE community notes; strap may interpret as
-        // "give me the next/first undelivered batch" or ignore it entirely.
+        syncACKTime = Date()
         syncTimeoutTask?.cancel()
         syncTimeoutTask = nil
-        print("[SyncManager] sending batchID=0 probe to trigger batch stream")
+        print("[Sync] ACK received — sending probe batchID=0")
         bleManager?.sendSyncCommand(WhoopCRC.buildBatchRequest(batchID: 0))
 
-        // Restart timeout — give strap 60 s to respond with 0xab ACKs after probe.
+        // Multi-stage retry if strap doesn't auto-stream 0xab ACKs:
+        //   t+15s: probe batchID=1
+        //   t+30s: re-send syncTrigger
+        //   t+60s: give up
         syncTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
             guard let self, !Task.isCancelled else { return }
+            guard self.isSyncing && self.batchQueue.isEmpty && self.activeBatchID == nil else { return }
+            print("[Sync] No 0xab after 15s — retrying probe batchID=1")
+            self.bleManager?.sendSyncCommand(WhoopCRC.buildBatchRequest(batchID: 1))
+
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled else { return }
+            guard self.isSyncing && self.batchQueue.isEmpty && self.activeBatchID == nil else { return }
+            print("[Sync] No 0xab after 30s — re-sending syncTrigger")
+            self.bleManager?.sendSyncCommand(WhoopCRC.syncTrigger)
+
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard !Task.isCancelled else { return }
             if self.isSyncing && self.batchQueue.isEmpty && self.activeBatchID == nil {
                 self.isSyncing = false
                 self.runSleepDetectionIfDone()
-                print("[SyncManager] timeout after probe — strap sent no batch ACKs")
+                print("[Sync] No batch stream after 60s — all probes ignored")
                 Task { [weak self] in
                     try? await Task.sleep(nanoseconds: 8_000_000_000)
                     await MainActor.run { self?.syncBannerVisible = false }
@@ -169,10 +207,30 @@ final class SyncManager: ObservableObject {
             activeBatchID = nil; activeChunks = []
         }
 
-        let ts      = readU32LE(bytes, at: 7)
+        let rawTs   = readU32LE(bytes, at: 7)
         let batchID = readU32LE(bytes, at: 17)
-        let date    = Date(timeIntervalSince1970: Double(ts))
+        // Validate: plausible Unix timestamps are between 2020 and 2035.
+        // Values outside that range are WHOOP internal clock ticks — convert via whoopToUnixOffset.
+        let unixTs: Double
+        let minPlausible: Double = 1_577_836_800  // 2020-01-01
+        let maxPlausible: Double = 2_051_222_400  // 2035-01-01
+        let raw = Double(rawTs)
+        if raw >= minPlausible && raw <= maxPlausible {
+            unixTs = raw
+        } else if let offset = whoopToUnixOffset, (raw + offset) >= minPlausible {
+            unixTs = raw + offset
+            print("[SyncManager] batch \(batchID) ts converted via whoopOffset: raw=\(rawTs) → \(Date(timeIntervalSince1970: unixTs))")
+        } else {
+            unixTs = Date().timeIntervalSince1970
+            print("[SyncManager] batch \(batchID) ts unresolvable (raw=\(rawTs)) — using now")
+        }
+        let date    = Date(timeIntervalSince1970: unixTs)
         activeBatchTimestamp = date   // set AFTER finalizing previous batch
+
+        if receivedBatchIDs.isEmpty, let ackTime = syncACKTime {
+            let delay = Date().timeIntervalSince(ackTime)
+            print("[Sync] First batch received after \(String(format: "%.1f", delay))s — strap auto-streams confirmed")
+        }
         print("[SyncManager] ack: batch=\(batchID) ts=\(date)")
 
         guard !processedBatches.contains(batchID) else {
@@ -183,6 +241,17 @@ final class SyncManager: ObservableObject {
             if batchQueue.isEmpty && activeBatchID == nil { scheduleIdleFinish() }
             return
         }
+
+        // Gap detection — WHOOP batchIDs may not be contiguous integers; treat as observation only.
+        if let prev = lastReceivedBatchID, batchID != prev + 1 {
+            print("[Sync] BatchID gap: expected \(prev + 1), got \(batchID) (delta=\(Int(batchID) - Int(prev)))")
+            batchIDGapCount += 1
+        }
+        lastReceivedBatchID = batchID
+        if batchID < minBatchID { minBatchID = batchID }
+        if batchID > maxBatchID { maxBatchID = batchID }
+        receivedBatchIDs.append(batchID)
+
         batchQueue.append(batchID)
         downloadNextBatchIfIdle()
     }
@@ -274,6 +343,12 @@ final class SyncManager: ObservableObject {
         let hk = bleManager?.healthKit
         hk?.writeHistoricalSamples(samples)
 
+        // Active energy — 1 sample ≈ 1 second; MET × 70 kg × (1/3600 h)
+        if let first = samples.first?.timestamp, let last = samples.last?.timestamp {
+            let kcal = samples.reduce(0.0) { $0 + metForHR($1.heartRate) * 70.0 / 3600.0 }
+            if kcal > 0 { hk?.writeActiveEnergy(kcal: kcal, start: first, end: last) }
+        }
+
         // Step detection
         let stepDetector = StepDetector()
         for s in samples { if let a = s.accelerometer { stepDetector.process(a) } }
@@ -285,8 +360,14 @@ final class SyncManager: ObservableObject {
             print("[SyncManager] batch \(id): +\(stepDetector.stepCount) steps (total \(totalSteps))")
         }
 
+        totalSamplesReceived += samples.count
+
         // Accumulate samples for post-sync sleep detection (runs once after all batches done).
-        let validSamples = samples.filter { $0.timestamp.timeIntervalSince1970 >= 1_672_531_200 } // ≥ 2023-01-01
+        let now = Date().timeIntervalSince1970
+        let validSamples = samples.filter {
+            let ts = $0.timestamp.timeIntervalSince1970
+            return ts >= 1_672_531_200 && ts <= now + 86400  // ≥ 2023-01-01 and ≤ tomorrow
+        }
         accumulatedSamples.append(contentsOf: validSamples)
         if validSamples.count < samples.count {
             print("[SyncManager] batch \(id): dropped \(samples.count - validSamples.count) sample(s) with pre-2023 timestamp")
@@ -461,12 +542,68 @@ final class SyncManager: ObservableObject {
     // MARK: - Post-sync sleep detection + recompute enqueue
 
     private func runSleepDetectionIfDone() {
+        // ── Batch ID statistics ────────────────────────────────────────────────
+        let expectedStr = expectedBatchCount > 0 ? "\(expectedBatchCount)" : "unknown"
+        let idSpan      = (minBatchID <= maxBatchID) ? Int(maxBatchID) - Int(minBatchID) + 1 : 0
+        let contiguous  = idSpan > 0 && idSpan == syncedBatchCount
+        if SyncManager.debugLogging {
+            print("[Sync Summary] ──────────────────────────────────────")
+            print("[Sync Summary]   Expected batches : \(expectedStr) (from 0xfc ACK)")
+            print("[Sync Summary]   Received batches : \(syncedBatchCount)")
+            if idSpan > 0 {
+                print("[Sync Summary]   BatchID range    : \(minBatchID) → \(maxBatchID) (span=\(idSpan))")
+                print("[Sync Summary]   Contiguous       : \(contiguous ? "YES" : "NO — expected \(idSpan) got \(syncedBatchCount)")")
+            }
+            print("[Sync Summary]   BatchID gaps     : \(batchIDGapCount)")
+            if !receivedBatchIDs.isEmpty {
+                let first10 = receivedBatchIDs.prefix(10).map { String($0) }.joined(separator: ", ")
+                print("[Sync Summary]   First IDs        : [\(first10)]")
+                if receivedBatchIDs.count > 10 {
+                    let last10 = receivedBatchIDs.suffix(10).map { String($0) }.joined(separator: ", ")
+                    print("[Sync Summary]   Last IDs         : [\(last10)]")
+                }
+            }
+        }
+
         // Collect affected dates before clearing (always include today)
         var dateKeys: Set<String> = [isoDateKey(Date())]
         for s in accumulatedSamples { dateKeys.insert(isoDateKey(s.timestamp)) }
 
         if !accumulatedSamples.isEmpty {
             let sorted = accumulatedSamples.sorted { $0.timestamp < $1.timestamp }
+
+            // ── Timestamp continuity analysis (same sorted array reused for sleep detection) ──
+            var tsGapCount = 0
+            var largestGapSec = 0.0
+            var largestGapAt: Date? = nil
+            for i in 1..<sorted.count {
+                let delta = sorted[i].timestamp.timeIntervalSince(sorted[i-1].timestamp)
+                if delta > 120 {
+                    tsGapCount += 1
+                    if delta > largestGapSec { largestGapSec = delta; largestGapAt = sorted[i-1].timestamp }
+                    if SyncManager.debugLogging {
+                        print("[Sync] Time gap: Δ=\(Int(delta))s at \(sorted[i-1].timestamp)")
+                    }
+                }
+            }
+
+            // ── Coverage + averages summary ────────────────────────────────────
+            if SyncManager.debugLogging, let first = sorted.first?.timestamp, let last = sorted.last?.timestamp {
+                let coverageHours = last.timeIntervalSince(first) / 3600
+                let avgPerBatch   = syncedBatchCount > 0 ? Double(totalSamplesReceived) / Double(syncedBatchCount) : 0
+                let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                print("[Sync Summary]   Time range       : \(fmt.string(from: first)) → \(fmt.string(from: last))")
+                print("[Sync Summary]   Coverage         : \(String(format: "%.1f", coverageHours)) hours")
+                print("[Sync Summary]   Total samples    : \(totalSamplesReceived)")
+                print("[Sync Summary]   Avg samples/batch: \(String(format: "%.1f", avgPerBatch))")
+                if let gapAt = largestGapAt {
+                    print("[Sync Summary]   TS gaps >120s    : \(tsGapCount) (largest Δ=\(Int(largestGapSec))s at \(fmt.string(from: gapAt)))")
+                } else {
+                    print("[Sync Summary]   TS gaps >120s    : 0")
+                }
+                print("[Sync Summary] ──────────────────────────────────────")
+            }
+
             let newSessions = SleepDetector().process(sorted)
             let uniqueNew = newSessions.filter { n in
                 guard n.end.timeIntervalSince(n.start) >= 1800 else { return false }
@@ -482,6 +619,9 @@ final class SyncManager: ObservableObject {
                 print("[SyncManager] sleep detection: no new sessions from \(sorted.count) samples")
             }
             accumulatedSamples = []
+        } else if SyncManager.debugLogging {
+            print("[Sync Summary]   Total samples    : 0 (no accumulated samples)")
+            print("[Sync Summary] ──────────────────────────────────────")
         }
 
         // Flush pendingBatchHR to RawDataStore atomically before enqueue — prevents race where
