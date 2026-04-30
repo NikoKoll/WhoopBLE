@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xcodegen generate *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(xargs ls *)",
+      "Bash(xcodebuild -scheme WhoopBLE -destination 'generic/platform=iOS' -configuration Debug CODE_SIGNING_ALLOWED=NO)",
+      "Bash(xcodebuild -project WhoopBLE.xcodeproj -scheme WhoopBLE -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' build)",
+      "Bash(python3 *)",
+      "Bash(xcodebuild -project /Users/nikolaskollias/WhoopBLE/WhoopBLE.xcodeproj -scheme WhoopBLE -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' build)",
+      "Bash(xcodebuild -project /Users/nikolaskollias/WhoopBLE/WhoopBLE.xcodeproj -scheme WhoopBLE -sdk iphonesimulator build)",
+      "Bash(xcodebuild -project WhoopBLE.xcodeproj -scheme WhoopBLE -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16' build)",
+      "Bash(xcodebuild -project WhoopBLE.xcodeproj -scheme WhoopBLE -sdk iphonesimulator build)",
+      "Bash(xcodebuild -project /Users/nikolaskollias/WhoopBLE/WhoopBLE.xcodeproj -scheme WhoopBLE -destination \"generic/platform=iOS\" -configuration Debug build)",
+      "Bash(swift demangle *)",
+      "Bash(xcrun swift-demangle *)",
+      "Bash(xcodebuild -project WhoopBLE.xcodeproj -scheme WhoopBLE -destination \"generic/platform=iOS\" -configuration Debug build)",
+      "WebFetch(domain:api.github.com)",
+      "WebSearch",
+      "WebFetch(domain:www.mintlify.com)",
+      "Bash(xcodebuild -scheme WhoopBLE -destination 'generic/platform=iOS' build)",
+      "Bash(xcodebuild -project WhoopBLE.xcodeproj -scheme WhoopBLE -destination 'generic/platform=iOS' -quiet)",
+      "Bash(xcodebuild -project WhoopBLE.xcodeproj -scheme WhoopBLE -destination 'generic/platform=iOS')"
+    ]
+  }
+}

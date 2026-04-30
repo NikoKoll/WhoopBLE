@@ -1,0 +1,89 @@
+{
+  "" : {
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLE-primary.dia",
+    "emit-module-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLE-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLE-primary-emit-module.dia",
+    "pch" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLE-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLE-primary.swiftdeps"
+  },
+  "/Users/nikolaskollias/WhoopBLE/Sources/BLE/BLEManager.swift" : {
+    "const-values" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/BLEManager.swiftconstvalues",
+    "dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/BLEManager.d",
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/BLEManager.dia",
+    "index-unit-output-path" : "/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/BLEManager.o",
+    "llvm-bc" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/BLEManager.bc",
+    "object" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/BLEManager.o",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/BLEManager.swiftdeps",
+    "swiftmodule" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/BLEManager~partial.swiftmodule"
+  },
+  "/Users/nikolaskollias/WhoopBLE/Sources/BLE/CRCCalculator.swift" : {
+    "const-values" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/CRCCalculator.swiftconstvalues",
+    "dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/CRCCalculator.d",
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/CRCCalculator.dia",
+    "index-unit-output-path" : "/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/CRCCalculator.o",
+    "llvm-bc" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/CRCCalculator.bc",
+    "object" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/CRCCalculator.o",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/CRCCalculator.swiftdeps",
+    "swiftmodule" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/CRCCalculator~partial.swiftmodule"
+  },
+  "/Users/nikolaskollias/WhoopBLE/Sources/BLE/PacketDecoder.swift" : {
+    "const-values" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/PacketDecoder.swiftconstvalues",
+    "dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/PacketDecoder.d",
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/PacketDecoder.dia",
+    "index-unit-output-path" : "/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/PacketDecoder.o",
+    "llvm-bc" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/PacketDecoder.bc",
+    "object" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/PacketDecoder.o",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/PacketDecoder.swiftdeps",
+    "swiftmodule" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/PacketDecoder~partial.swiftmodule"
+  },
+  "/Users/nikolaskollias/WhoopBLE/Sources/Models/WhoopMetrics.swift" : {
+    "const-values" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopMetrics.swiftconstvalues",
+    "dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopMetrics.d",
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopMetrics.dia",
+    "index-unit-output-path" : "/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopMetrics.o",
+    "llvm-bc" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopMetrics.bc",
+    "object" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopMetrics.o",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopMetrics.swiftdeps",
+    "swiftmodule" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopMetrics~partial.swiftmodule"
+  },
+  "/Users/nikolaskollias/WhoopBLE/Sources/Views/ContentView.swift" : {
+    "const-values" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/ContentView.swiftconstvalues",
+    "dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/ContentView.d",
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/ContentView.dia",
+    "index-unit-output-path" : "/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/ContentView.o",
+    "llvm-bc" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/ContentView.bc",
+    "object" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/ContentView.o",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/ContentView.swiftdeps",
+    "swiftmodule" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/ContentView~partial.swiftmodule"
+  },
+  "/Users/nikolaskollias/WhoopBLE/Sources/Views/DashboardView.swift" : {
+    "const-values" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/DashboardView.swiftconstvalues",
+    "dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/DashboardView.d",
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/DashboardView.dia",
+    "index-unit-output-path" : "/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/DashboardView.o",
+    "llvm-bc" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/DashboardView.bc",
+    "object" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/DashboardView.o",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/DashboardView.swiftdeps",
+    "swiftmodule" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/DashboardView~partial.swiftmodule"
+  },
+  "/Users/nikolaskollias/WhoopBLE/Sources/Views/SettingsView.swift" : {
+    "const-values" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/SettingsView.swiftconstvalues",
+    "dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/SettingsView.d",
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/SettingsView.dia",
+    "index-unit-output-path" : "/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/SettingsView.o",
+    "llvm-bc" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/SettingsView.bc",
+    "object" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/SettingsView.o",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/SettingsView.swiftdeps",
+    "swiftmodule" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/SettingsView~partial.swiftmodule"
+  },
+  "/Users/nikolaskollias/WhoopBLE/Sources/WhoopBLEApp.swift" : {
+    "const-values" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLEApp.swiftconstvalues",
+    "dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLEApp.d",
+    "diagnostics" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLEApp.dia",
+    "index-unit-output-path" : "/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLEApp.o",
+    "llvm-bc" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLEApp.bc",
+    "object" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLEApp.o",
+    "swift-dependencies" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLEApp.swiftdeps",
+    "swiftmodule" : "/Users/nikolaskollias/WhoopBLE/build/WhoopBLE.build/Debug-iphonesimulator/WhoopBLE.build/Objects-normal/arm64/WhoopBLEApp~partial.swiftmodule"
+  }
+}
