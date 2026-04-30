@@ -1,0 +1,26 @@
+# Build artifacts — never commit compiled output
+build/
+DerivedData/
+
+# Xcode generated project — source of truth is project.yml (xcodegen)
+# Regenerate with: xcodegen generate
+WhoopBLE.xcodeproj/
+
+# Xcode user state — machine/session specific
+*.xcuserstate
+xcuserdata/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Claude Code local settings — personal config, not shared
+.claude/settings.local.json
+
+# Swift Package Manager
+.build/
+*.resolved
+
+# Editor temp files
+*.swp
+*.swo
