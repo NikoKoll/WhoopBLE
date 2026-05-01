@@ -77,23 +77,43 @@ final class HealthKitWriter {
         }
     }
 
-    // MARK: - Workout (Exercise ring)
-    // Saves a short HKWorkout via HKWorkoutBuilder. HKWorkout duration credits Exercise minutes
-    // on iPhone-only (no Apple Watch) setups. Activity type .other keeps it generic.
-    func writeWorkout(start: Date, end: Date, kcal: Double, activity: HKWorkoutActivityType = .other) {
-        guard end > start else { return }
+    // MARK: - Workout (Exercise + Move rings)
+    // Writes ONE HKWorkout with linked activeEnergyBurned + heartRate samples.
+    // All samples are clamped to [start, end] so the Workout detail view in Health groups them.
+    // Caller is responsible for Watch-suppression check before invoking.
+    func writeWorkoutSession(start: Date, end: Date, kcal: Double,
+                             energyBuckets: [(Date, Date, Double)],
+                             hrSamples: [(ts: Date, bpm: Int)],
+                             activity: HKWorkoutActivityType) {
+        guard end > start, kcal > 0 else { return }
         let config = HKWorkoutConfiguration()
         config.activityType = activity
         let builder = HKWorkoutBuilder(healthStore: store, configuration: config, device: .local())
-        builder.beginCollection(withStart: start) { @Sendable [store] success, error in
+
+        // Build sample array. Clamp every sample window into [start, end].
+        var samples: [HKSample] = []
+        let energyType = HKQuantityType(.activeEnergyBurned)
+        let kcalUnit = HKUnit.kilocalorie()
+        var droppedEnergy = 0
+        for (bs, be, kc) in energyBuckets where kc > 0 {
+            let s = max(bs, start), e = min(be, end)
+            guard e > s else { droppedEnergy += 1; continue }
+            let q = HKQuantity(unit: kcalUnit, doubleValue: kc)
+            samples.append(HKQuantitySample(type: energyType, quantity: q, start: s, end: e))
+        }
+        if droppedEnergy > 0 { print("[HK] Sample window mismatch: dropped \(droppedEnergy) energy bucket(s)") }
+
+        let hrType = HKQuantityType(.heartRate)
+        let hrUnit = HKUnit.count().unitDivided(by: .minute())
+        for h in hrSamples {
+            guard h.ts >= start, h.ts <= end, h.bpm >= 30, h.bpm <= 220 else { continue }
+            let q = HKQuantity(unit: hrUnit, doubleValue: Double(h.bpm))
+            samples.append(HKQuantitySample(type: hrType, quantity: q, start: h.ts, end: h.ts))
+        }
+
+        builder.beginCollection(withStart: start) { @Sendable success, error in
             if let error { print("[HK] Workout begin error: \(error.localizedDescription)"); return }
             guard success else { return }
-
-            var samples: [HKSample] = []
-            if kcal > 0 {
-                let q = HKQuantity(unit: .kilocalorie(), doubleValue: kcal)
-                samples.append(HKQuantitySample(type: HKQuantityType(.activeEnergyBurned), quantity: q, start: start, end: end))
-            }
 
             let finish: @Sendable (Bool, Error?) -> Void = { _, addErr in
                 if let addErr { print("[HK] Workout add error: \(addErr.localizedDescription)") }
@@ -103,18 +123,16 @@ final class HealthKitWriter {
                         if let finErr { print("[HK] Workout finish error: \(finErr.localizedDescription)") }
                         else if workout != nil {
                             let mins = end.timeIntervalSince(start) / 60.0
-                            print("[HK] Workout: \(String(format: "%.1f", mins)) min, \(String(format: "%.1f", kcal)) kcal (\(start) → \(end))")
+                            let nE = samples.filter { $0 is HKQuantitySample && ($0 as! HKQuantitySample).quantityType == energyType }.count
+                            let nH = samples.count - nE
+                            print("[HK] Workout linked: \(nE) energy + \(nH) HR samples — \(String(format: "%.1f", mins)) min, \(String(format: "%.1f", kcal)) kcal, type=\(activity.rawValue)")
                         }
                     }
                 }
-                _ = store
             }
 
-            if samples.isEmpty {
-                finish(true, nil)
-            } else {
-                builder.add(samples, completion: finish)
-            }
+            if samples.isEmpty { finish(true, nil) }
+            else { builder.add(samples, completion: finish) }
         }
     }
 

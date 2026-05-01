@@ -76,6 +76,7 @@ final class BLEManager: NSObject, ObservableObject {
     private let exerciseMETThreshold: Double = 3.0
 
     let healthKit      = HealthKitWriter()
+    lazy var workoutAggregator = WorkoutSessionAggregator(healthKit: healthKit)
     let syncManager    = SyncManager()
     let liveSleep      = LiveSleepMonitor()
     let metricsStore   = MetricsStore()
@@ -231,8 +232,12 @@ final class BLEManager: NSObject, ObservableObject {
 
         let durationHours = 1.0 / 3600.0  // assume ~1 sample/sec
         let met = metForHR(metrics.heartRate)
-        pendingEnergyKcal += met * userWeightKg * durationHours
+        let kcalDelta = met * userWeightKg * durationHours
+        pendingEnergyKcal += kcalDelta
         if met >= exerciseMETThreshold { pendingExerciseSec += 1.0 }
+
+        // Feed session aggregator. Aggregator owns the workout emit; this method only owns Move-ring standalone writes.
+        workoutAggregator.observe(timestamp: metrics.timestamp, hr: metrics.heartRate, met: met, kcalDelta: kcalDelta)
 
         // Flush every 3 minutes
         let elapsed = metrics.timestamp.timeIntervalSince(lastActivityFlush)
@@ -256,17 +261,15 @@ final class BLEManager: NSObject, ObservableObject {
         activityWindowStart = windowEnd
         lastActivityFlush = windowEnd
 
-        // Exercise ring: if ≥ 60s of brisk activity in this 3-min window, write an HKWorkout
-        // covering the active span. Workout duration credits Apple Exercise time on iPhone-only setups.
-        if exerciseSec >= 60 {
-            let workoutEnd = windowEnd
-            let workoutStart = workoutEnd.addingTimeInterval(-exerciseSec)
-            // kcal portion attributable to the exercise span (proportional)
-            let workoutKcal = kcal * (exerciseSec / max(1, elapsed))
-            healthKit.writeWorkout(start: workoutStart, end: workoutEnd, kcal: workoutKcal)
-        }
+        _ = exerciseSec  // exercise-minute credit now comes from HKWorkout (aggregator emits one per session)
 
         guard kcal > 0, kcal < 100 else { return }
+        // While a workout session is active the aggregator owns energy → skip standalone write
+        // to avoid double-counting against Move ring.
+        if workoutAggregator.isSessionActive {
+            print("[HK] Energy skipped: session active (\(String(format: "%.1f", kcal)) kcal absorbed by workout)")
+            return
+        }
         // Suppress live write if Apple Watch wrote activeEnergyBurned in the last 5 min — Watch dominates Move ring.
         Task { [healthKit, kcal, windowStart, windowEnd] in
             let watchActive = await healthKit.watchEnergyActiveRecently()
@@ -429,8 +432,10 @@ extension BLEManager: CBCentralManagerDelegate {
             smoothedHRV = nil
             batteryLevel = nil
             connectionState = .disconnected
+            // Close any open workout session first (emits ONE workout if duration ≥ 60s).
+            workoutAggregator.flush(now: Date())
             // Flush pending kcal before clearing — don't discard partial window
-            if pendingEnergyKcal > 0, activityWindowStart != .distantPast {
+            if pendingEnergyKcal > 0, activityWindowStart != .distantPast, !workoutAggregator.isSessionActive {
                 let now = Date()
                 let kcal = min(pendingEnergyKcal, 99)
                 if kcal > 0 {
