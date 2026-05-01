@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var ble: BLEManager
     @State private var showClearConfirm = false
+    @AppStorage("userWeightKg") private var userWeightKg: Double = 78
 
     var body: some View {
         Form {
@@ -39,6 +40,18 @@ struct SettingsView: View {
                     ble.disconnect()
                 }
                 .disabled(ble.connectionState == .disconnected)
+            }
+
+            Section("Profile") {
+                HStack {
+                    Text("Weight")
+                    Spacer()
+                    TextField("kg", value: $userWeightKg, format: .number)
+                        .keyboardType(.decimalPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 80)
+                    Text("kg").foregroundStyle(.secondary)
+                }
             }
 
             Section("Data") {

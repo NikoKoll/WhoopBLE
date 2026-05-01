@@ -12,7 +12,8 @@ final class HealthKitWriter {
             HKQuantityType(.heartRateVariabilitySDNN),
             HKQuantityType(.stepCount),
             HKQuantityType(.activeEnergyBurned),
-            HKCategoryType(.sleepAnalysis)
+            HKCategoryType(.sleepAnalysis),
+            HKObjectType.workoutType()
         ]
         let read: Set<HKObjectType> = [
             HKQuantityType(.heartRate),
@@ -76,6 +77,47 @@ final class HealthKitWriter {
         }
     }
 
+    // MARK: - Workout (Exercise ring)
+    // Saves a short HKWorkout via HKWorkoutBuilder. HKWorkout duration credits Exercise minutes
+    // on iPhone-only (no Apple Watch) setups. Activity type .other keeps it generic.
+    func writeWorkout(start: Date, end: Date, kcal: Double, activity: HKWorkoutActivityType = .other) {
+        guard end > start else { return }
+        let config = HKWorkoutConfiguration()
+        config.activityType = activity
+        let builder = HKWorkoutBuilder(healthStore: store, configuration: config, device: .local())
+        builder.beginCollection(withStart: start) { @Sendable [store] success, error in
+            if let error { print("[HK] Workout begin error: \(error.localizedDescription)"); return }
+            guard success else { return }
+
+            var samples: [HKSample] = []
+            if kcal > 0 {
+                let q = HKQuantity(unit: .kilocalorie(), doubleValue: kcal)
+                samples.append(HKQuantitySample(type: HKQuantityType(.activeEnergyBurned), quantity: q, start: start, end: end))
+            }
+
+            let finish: @Sendable (Bool, Error?) -> Void = { _, addErr in
+                if let addErr { print("[HK] Workout add error: \(addErr.localizedDescription)") }
+                builder.endCollection(withEnd: end) { @Sendable _, endErr in
+                    if let endErr { print("[HK] Workout end error: \(endErr.localizedDescription)"); return }
+                    builder.finishWorkout { @Sendable workout, finErr in
+                        if let finErr { print("[HK] Workout finish error: \(finErr.localizedDescription)") }
+                        else if workout != nil {
+                            let mins = end.timeIntervalSince(start) / 60.0
+                            print("[HK] Workout: \(String(format: "%.1f", mins)) min, \(String(format: "%.1f", kcal)) kcal (\(start) → \(end))")
+                        }
+                    }
+                }
+                _ = store
+            }
+
+            if samples.isEmpty {
+                finish(true, nil)
+            } else {
+                builder.add(samples, completion: finish)
+            }
+        }
+    }
+
     // MARK: - Active Energy (Move ring)
     func writeActiveEnergy(kcal: Double, start: Date, end: Date) {
         guard kcal > 0, end > start else { return }
@@ -85,6 +127,28 @@ final class HealthKitWriter {
         store.save(sample) { @Sendable _, error in
             if let error { print("[HK] Energy write error: \(error.localizedDescription)") }
             else { print("[HK] Energy written: \(String(format: "%.1f", kcal)) kcal (\(start) → \(end))") }
+        }
+    }
+
+    // Returns true if any HealthKit source containing "Watch" wrote an activeEnergyBurned sample in
+    // the last `lookback` seconds. Used to suppress live writes when Apple Watch is on the wrist
+    // (avoids double-counting against Move ring).
+    func watchEnergyActiveRecently(lookback: TimeInterval = 300) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let type = HKQuantityType(.activeEnergyBurned)
+            let end = Date()
+            let start = end.addingTimeInterval(-lookback)
+            let pred = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+            let query = HKSampleQuery(sampleType: type, predicate: pred, limit: 50,
+                                      sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)]) { _, samples, _ in
+                let watchActive = samples?.contains { sample in
+                    let name = sample.sourceRevision.source.name.lowercased()
+                    let bundle = sample.sourceRevision.source.bundleIdentifier.lowercased()
+                    return name.contains("watch") || bundle.contains("com.apple.health.")
+                } ?? false
+                cont.resume(returning: watchActive)
+            }
+            store.execute(query)
         }
     }
 
@@ -109,26 +173,44 @@ final class HealthKitWriter {
     }
 
     // MARK: - Sleep analysis
+    // If `stages` are present, emit per-stage HKCategorySamples (asleepDeep/Core/REM/awake).
+    // Otherwise fall back to one asleepUnspecified sample per session.
     func writeSleep(_ sessions: [SleepSession]) {
         guard !sessions.isEmpty else { return }
-        let maxSleepDuration: TimeInterval = 86400  // HealthKit cap: 24h
+        let maxSleepDuration: TimeInterval = 86400
         let now = Date()
-        let samples: [HKSample] = sessions.compactMap {
-            let start = $0.start
-            let end   = min($0.end, start.addingTimeInterval(maxSleepDuration))
+        let type = HKCategoryType(.sleepAnalysis)
+        var samples: [HKSample] = []
+
+        for session in sessions {
+            let start = session.start
+            let end   = min(session.end, start.addingTimeInterval(maxSleepDuration))
             guard end > start, end <= now.addingTimeInterval(3600) else {
                 print("[HealthKit] sleep session skipped: invalid range \(start) → \(end)")
-                return nil
+                continue
             }
-            return HKCategorySample(
-                type: HKCategoryType(.sleepAnalysis),
-                value: HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
-                start: start, end: end
-            )
+            if let stages = session.stages, !stages.isEmpty {
+                for seg in stages {
+                    guard seg.end > seg.start, seg.end <= end.addingTimeInterval(60) else { continue }
+                    let value: HKCategoryValueSleepAnalysis = {
+                        switch seg.stage {
+                        case .deep:  return .asleepDeep
+                        case .core:  return .asleepCore
+                        case .rem:   return .asleepREM
+                        case .awake: return .awake
+                        }
+                    }()
+                    samples.append(HKCategorySample(type: type, value: value.rawValue, start: seg.start, end: seg.end))
+                }
+            } else {
+                samples.append(HKCategorySample(type: type, value: HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue, start: start, end: end))
+            }
         }
+
+        guard !samples.isEmpty else { return }
         store.save(samples) { @Sendable _, error in
             if let error { print("[HealthKit] sleep write error: \(error.localizedDescription)") }
-            else { print("[HealthKit] wrote \(samples.count) sleep session(s)") }
+            else { print("[HealthKit] wrote \(samples.count) sleep sample(s)") }
         }
     }
 }

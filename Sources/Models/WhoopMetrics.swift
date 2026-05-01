@@ -28,9 +28,43 @@ struct HistoricalSample: Sendable {
     let timestamp: Date
     let heartRate: Int
     let accelerometer: AccelerometerSample?
+    let rrIntervals: [Double]?   // seconds; nil when chunk format carries no RR data
+
+    init(timestamp: Date, heartRate: Int, accelerometer: AccelerometerSample? = nil, rrIntervals: [Double]? = nil) {
+        self.timestamp = timestamp
+        self.heartRate = heartRate
+        self.accelerometer = accelerometer
+        self.rrIntervals = rrIntervals
+    }
+}
+
+enum SleepStage: String, Sendable, Codable {
+    case deep, core, rem, awake
+}
+
+struct SleepStageSegment: Sendable, Codable {
+    let start: Date
+    let end: Date
+    let stage: SleepStage
 }
 
 struct SleepSession: Sendable, Codable {
     let start: Date
     let end: Date
+    let stages: [SleepStageSegment]?
+
+    init(start: Date, end: Date, stages: [SleepStageSegment]? = nil) {
+        self.start = start
+        self.end = end
+        self.stages = stages
+    }
+
+    // Custom decoder so legacy persisted sessions (no `stages` key) still decode.
+    private enum CodingKeys: String, CodingKey { case start, end, stages }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.start = try c.decode(Date.self, forKey: .start)
+        self.end = try c.decode(Date.self, forKey: .end)
+        self.stages = try c.decodeIfPresent([SleepStageSegment].self, forKey: .stages)
+    }
 }

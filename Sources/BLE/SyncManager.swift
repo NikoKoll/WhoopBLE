@@ -343,9 +343,11 @@ final class SyncManager: ObservableObject {
         let hk = bleManager?.healthKit
         hk?.writeHistoricalSamples(samples)
 
-        // Active energy — 1 sample ≈ 1 second; MET × 70 kg × (1/3600 h)
+        // Active energy — 1 sample ≈ 1 second; metActive × weight × (1/3600 h)
         if let first = samples.first?.timestamp, let last = samples.last?.timestamp {
-            let kcal = samples.reduce(0.0) { $0 + metForHR($1.heartRate) * 70.0 / 3600.0 }
+            let weight = UserDefaults.standard.double(forKey: "userWeightKg")
+            let weightKg = weight > 0 ? weight : 78.0
+            let kcal = samples.reduce(0.0) { $0 + metForHR($1.heartRate) * weightKg / 3600.0 }
             if kcal > 0 { hk?.writeActiveEnergy(kcal: kcal, start: first, end: last) }
         }
 
@@ -417,9 +419,22 @@ final class SyncManager: ObservableObject {
             guard hr >= 30, hr <= 220 else {
                 print("[SyncManager] 0xa1 chunk rejected: hr=\(hr)"); return nil
             }
+            // RR intervals: count at byte[22], up to 4 UInt16 LE ms values starting at byte[23].
+            var rrs: [Double] = []
+            if bytes.count >= 31 {
+                let rrCount = min(4, Int(bytes[22]))
+                for i in 0..<rrCount {
+                    let off = 23 + i * 2
+                    guard off + 1 < bytes.count else { break }
+                    let ms = UInt16(bytes[off]) | (UInt16(bytes[off + 1]) << 8)
+                    let secs = Double(ms) / 1000.0
+                    if secs >= 0.3 && secs <= 2.0 { rrs.append(secs) }
+                }
+            }
             let offsetSecs = Double(chunkSeq - maxChunkSeq)  // ≤ 0, so timestamp ≤ batchTs
             let timestamp = batchTs.addingTimeInterval(offsetSecs)
-            return HistoricalSample(timestamp: timestamp, heartRate: hr, accelerometer: nil)
+            return HistoricalSample(timestamp: timestamp, heartRate: hr, accelerometer: nil,
+                                    rrIntervals: rrs.isEmpty ? nil : rrs)
         }
 
         let tsAt: Int

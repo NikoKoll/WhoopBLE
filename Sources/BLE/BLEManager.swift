@@ -2,17 +2,13 @@ import CoreBluetooth
 import CoreMotion
 import Combine
 
-// MET values per HR zone (maxHR = 185 BPM). Used by both live (BLEManager) and historical (SyncManager).
-func metForHR(_ bpm: Int, maxHR: Double = 185) -> Double {
+// Active MET above resting (BMR excluded). Continuous curve so sedentary HR still credits Move ring.
+// metTotal = 1.0 + max(0, (pct - 0.30) * 14), capped at 11. metActive = metTotal - 1.0.
+// At HR 70 (pct ~0.36) → metActive ~0.84; at HR 110 (pct ~0.56) → ~3.6; at HR 170 (pct ~0.87) → ~8.0.
+func metForHR(_ bpm: Int, maxHR: Double = 196) -> Double {
     let pct = Double(bpm) / maxHR
-    switch pct {
-    case ..<0.50: return 0       // resting
-    case 0.50..<0.60: return 2.0 // Z1
-    case 0.60..<0.70: return 3.5 // Z2
-    case 0.70..<0.80: return 6.0 // Z3
-    case 0.80..<0.90: return 8.0 // Z4
-    default:          return 10.0 // Z5
-    }
+    let metTotal = min(11.0, 1.0 + max(0, (pct - 0.30) * 14.0))
+    return max(0, metTotal - 1.0)
 }
 
 private enum WUUID {
@@ -72,6 +68,12 @@ final class BLEManager: NSObject, ObservableObject {
     private var activityWindowStart: Date = .distantPast
     private var lastActivityFlush: Date = .distantPast
     private let activityFlushInterval: TimeInterval = 180  // 3 minutes
+    private var stepsAtWindowStart: Int = 0
+    private let minWalkingKcalPerMin: Double = 4.5
+    // Seconds within the current activity window where metActive ≥ 3 (brisk-walk equivalent).
+    // Flushed as Apple Exercise Time minutes alongside active energy.
+    private var pendingExerciseSec: Double = 0
+    private let exerciseMETThreshold: Double = 3.0
 
     let healthKit      = HealthKitWriter()
     let syncManager    = SyncManager()
@@ -211,18 +213,26 @@ final class BLEManager: NSObject, ObservableObject {
 
     // MARK: - Activity ring accumulation
 
-    private static let defaultWeightKg: Double = 70
+    private static let defaultWeightKg: Double = 78
+
+    // Configurable user weight backing AppStorage("userWeightKg"). Read each sample so live updates take effect.
+    private var userWeightKg: Double {
+        let v = UserDefaults.standard.double(forKey: "userWeightKg")
+        return v > 0 ? v : BLEManager.defaultWeightKg
+    }
 
     private func accumulateActivity(_ metrics: WhoopMetrics) {
         // Initialize window start on first sample after connection/flush
         if activityWindowStart == .distantPast {
             activityWindowStart = metrics.timestamp
             lastActivityFlush   = metrics.timestamp
+            stepsAtWindowStart  = dailySteps
         }
 
         let durationHours = 1.0 / 3600.0  // assume ~1 sample/sec
         let met = metForHR(metrics.heartRate)
-        pendingEnergyKcal += met * BLEManager.defaultWeightKg * durationHours
+        pendingEnergyKcal += met * userWeightKg * durationHours
+        if met >= exerciseMETThreshold { pendingExerciseSec += 1.0 }
 
         // Flush every 3 minutes
         let elapsed = metrics.timestamp.timeIntervalSince(lastActivityFlush)
@@ -230,13 +240,45 @@ final class BLEManager: NSObject, ObservableObject {
 
         let windowEnd = metrics.timestamp
         let windowStart = activityWindowStart
-        let kcal = pendingEnergyKcal
+        let windowDurationMin = elapsed / 60.0
+        var kcal = pendingEnergyKcal
 
+        // Walking floor: if steps increased during window, ensure minimum burn
+        let currentSteps = dailySteps
+        if currentSteps > stepsAtWindowStart {
+            kcal = max(kcal, minWalkingKcalPerMin * windowDurationMin)
+        }
+        stepsAtWindowStart = currentSteps
+
+        let exerciseSec = pendingExerciseSec
         pendingEnergyKcal = 0
+        pendingExerciseSec = 0
         activityWindowStart = windowEnd
         lastActivityFlush = windowEnd
 
-        healthKit.writeActiveEnergy(kcal: kcal, start: windowStart, end: windowEnd)
+        // Exercise ring: if ≥ 60s of brisk activity in this 3-min window, write an HKWorkout
+        // covering the active span. Workout duration credits Apple Exercise time on iPhone-only setups.
+        if exerciseSec >= 60 {
+            let workoutEnd = windowEnd
+            let workoutStart = workoutEnd.addingTimeInterval(-exerciseSec)
+            // kcal portion attributable to the exercise span (proportional)
+            let workoutKcal = kcal * (exerciseSec / max(1, elapsed))
+            healthKit.writeWorkout(start: workoutStart, end: workoutEnd, kcal: workoutKcal)
+        }
+
+        guard kcal > 0, kcal < 100 else { return }
+        // Suppress live write if Apple Watch wrote activeEnergyBurned in the last 5 min — Watch dominates Move ring.
+        Task { [healthKit, kcal, windowStart, windowEnd] in
+            let watchActive = await healthKit.watchEnergyActiveRecently()
+            if watchActive {
+                print("[HK] Energy suppressed: watch active (\(String(format: "%.1f", kcal)) kcal skipped)")
+                return
+            }
+            await MainActor.run {
+                healthKit.writeActiveEnergy(kcal: kcal, start: windowStart, end: windowEnd)
+                print("[HK] Energy: \(String(format: "%.1f", kcal)) kcal (\(windowStart) → \(windowEnd))")
+            }
+        }
     }
 
     // MARK: - Shared helper: update published metrics from any HR source.
@@ -387,9 +429,19 @@ extension BLEManager: CBCentralManagerDelegate {
             smoothedHRV = nil
             batteryLevel = nil
             connectionState = .disconnected
+            // Flush pending kcal before clearing — don't discard partial window
+            if pendingEnergyKcal > 0, activityWindowStart != .distantPast {
+                let now = Date()
+                let kcal = min(pendingEnergyKcal, 99)
+                if kcal > 0 {
+                    healthKit.writeActiveEnergy(kcal: kcal, start: activityWindowStart, end: now)
+                    print("[HK] Energy (disconnect flush): \(String(format: "%.1f", kcal)) kcal")
+                }
+            }
             pendingEnergyKcal = 0
             activityWindowStart = .distantPast
             lastActivityFlush = .distantPast
+            stepsAtWindowStart = 0
             startScanning()
         }
     }
