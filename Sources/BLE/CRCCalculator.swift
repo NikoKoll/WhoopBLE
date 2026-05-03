@@ -47,6 +47,8 @@ enum WhoopCRC {
     }
 
     static let enableHealth      = buildCommand(category: 0x03, value: 0x01)
+    // 0x02 = keepalive (external RE docs); distinct from 0x01 (start recording).
+    static let keepaliveHealth   = buildCommand(category: 0x03, value: 0x02)
     static let disableHealth     = buildCommand(category: 0x03, value: 0x00)
     static let enableHRBroadcast = buildCommand(category: 0x0E, value: 0x01)
     // Triggers historical batch enumeration on DATA_FROM_STRAP (category=0x16).

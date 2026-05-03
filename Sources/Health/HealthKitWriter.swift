@@ -117,6 +117,25 @@ final class HealthKitWriter {
         }
     }
 
+    /// Most recent SpO2 sample within the last 24 hours as a percentage (0–100), or nil if none.
+    func readLatestSpO2() async -> Double? {
+        await withCheckedContinuation { (cont: CheckedContinuation<Double?, Never>) in
+            let type  = HKQuantityType(.oxygenSaturation)
+            let end   = Date()
+            let start = end.addingTimeInterval(-24 * 3600)
+            let pred  = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+            let sort  = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: false)
+            let q = HKSampleQuery(sampleType: type, predicate: pred, limit: 1,
+                                  sortDescriptors: [sort]) { _, samples, _ in
+                // HK stores oxygenSaturation as a fraction via HKUnit.percent() (0.98 = 98%).
+                let frac = (samples?.first as? HKQuantitySample)?
+                    .quantity.doubleValue(for: HKUnit.percent())
+                cont.resume(returning: frac.map { $0 * 100 })
+            }
+            self.store.execute(q)
+        }
+    }
+
     // MARK: - Live HR (throttled to 5-second minimum interval)
     func write(_ metrics: WhoopMetrics) {
         guard metrics.timestamp.timeIntervalSince(lastWriteDate) >= 5 else { return }

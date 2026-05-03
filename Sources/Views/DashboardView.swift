@@ -65,14 +65,48 @@ struct DashboardView: View {
     private let stalenessThreshold: TimeInterval = 60
 
     private var metrics: WhoopMetrics? { ble.latestMetrics }
-    // 15-sample (~15 s) smoothed HR for the ring — avoids jitter from single-packet spikes
+    // 15-sample (~15 s) smoothed HR — avoids jitter from single-packet spikes
     private var heartRate: Int { ble.smoothedHR > 0 ? ble.smoothedHR : (metrics?.heartRate ?? 0) }
-    private var ringProgress: Double { min(Double(heartRate) / 200.0, 1.0) }
     private var zoneColor: Color { HRZone.color(for: heartRate) }
 
     private var isStale: Bool {
         guard let ts = metrics?.timestamp else { return false }
         return now.timeIntervalSince(ts) > stalenessThreshold
+    }
+
+    // MARK: - Sleep ring computed values
+    private var sleepProgress: Double {
+        guard let got = ble.todaySleepMinutes,
+              let need = ble.todaySleepNeedMinutes, need > 0 else { return 0 }
+        return min(Double(got) / Double(need), 1.0)
+    }
+    private var sleepPct: Int { Int(sleepProgress * 100) }
+    private var sleepColor: Color {
+        guard ble.todaySleepMinutes != nil else { return .gray.opacity(0.35) }
+        if sleepPct >= 85 { return .green }
+        if sleepPct >= 70 { return .yellow }
+        return .red
+    }
+    private var sleepSubtitle: String {
+        guard let mins = ble.todaySleepMinutes else { return "—" }
+        let h = mins / 60, m = mins % 60
+        return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+    }
+
+    // MARK: - Strain ring computed values
+    private var strainProgress: Double { (ble.todayStrain ?? 0) / 21.0 }
+    private var strainTargetBand: (lo: Double, hi: Double) {
+        guard let recovery = ble.recoveryScore else { return (10.0, 14.0) }
+        if recovery >= 67 { return (14.0, 18.0) }
+        if recovery >= 34 { return (10.0, 14.0) }
+        return (6.0, 10.0)
+    }
+    private var strainColor: Color {
+        guard let strain = ble.todayStrain else { return .gray.opacity(0.35) }
+        let band = strainTargetBand
+        if strain < band.lo { return .yellow }
+        if strain > band.hi { return .red }
+        return .green
     }
 
     private var sessionStats: (min: Int, avg: Int, max: Int)? {
@@ -91,6 +125,8 @@ struct DashboardView: View {
 
                     topSection
                         .padding(.top, 4)
+
+                    DashCard { vitalsTileRow }
 
                     if let stats = sessionStats {
                         DashCard { statsBar(stats) }
@@ -190,79 +226,170 @@ struct DashboardView: View {
         )
     }
 
-    // MARK: - Top Section (HR ring + Recovery ring)
+    // MARK: - Top Section (Sleep · Strain · Recovery rings)
 
     private var topSection: some View {
-        HStack(alignment: .center, spacing: 16) {
-            hrRing
+        HStack(alignment: .center, spacing: 0) {
+            sleepRing
+            strainRing
             recoveryRing
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
     }
 
-    private var hrRing: some View {
-        ZStack {
-            // Soft outer halo
-            Circle()
-                .fill(zoneColor.opacity(isStale ? 0.04 : 0.16))
-                .frame(width: 180, height: 180)
-                .blur(radius: 24)
-                .animation(.smoothFallback(duration: 0.8), value: zoneColor)
-                .animation(.smoothFallback(duration: 0.8), value: isStale)
+    // MARK: - BPM + SpO2 tile row
 
-            // Track
-            Circle()
-                .stroke(Color.white.opacity(0.08), lineWidth: 12)
-                .frame(width: 150, height: 150)
-
-            // Progress
-            Circle()
-                .trim(from: 0, to: ringProgress)
-                .stroke(
-                    AngularGradient(
-                        colors: [zoneColor.opacity(0.45), zoneColor, zoneColor.opacity(0.85)],
-                        center: .center,
-                        startAngle: .degrees(-90),
-                        endAngle: .degrees(270)
-                    ),
-                    style: StrokeStyle(lineWidth: 12, lineCap: .round)
-                )
-                .frame(width: 150, height: 150)
-                .rotationEffect(.degrees(-90))
-                .shadow(color: zoneColor.opacity(isStale ? 0 : 0.5), radius: 8)
-                .animation(.smoothFallback(duration: 0.5), value: ringProgress)
-                .animation(.smoothFallback(duration: 0.6), value: zoneColor)
-                .opacity(isStale ? 0.35 : 1.0)
-                .animation(.easeInOut(duration: 0.5), value: isStale)
-
-            VStack(spacing: 2) {
+    private var vitalsTileRow: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 4) {
                 Text(heartRate > 0 ? "\(heartRate)" : "—")
-                    .font(.system(size: 44, weight: .bold, design: .rounded))
-                    .foregroundStyle(isStale ? Color.white.opacity(0.35) : .white)
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(isStale ? zoneColor.opacity(0.4) : zoneColor)
                     .contentTransition(.numericText())
                     .animation(.smoothFallback(duration: 0.35), value: heartRate)
-                    .animation(.smoothFallback(duration: 0.5), value: isStale)
                 Text("BPM")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.45))
-                    .kerning(2.5)
+                    .kerning(2.0)
                 if heartRate > 0 {
                     Text(HRZone.label(for: heartRate).uppercased())
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(zoneColor)
                         .kerning(1.5)
-                        .padding(.horizontal, 8)
+                        .padding(.horizontal, 7)
                         .padding(.vertical, 2)
-                        .background(
-                            Capsule().fill(zoneColor.opacity(0.15))
-                        )
-                        .padding(.top, 2)
+                        .background(Capsule().fill(zoneColor.opacity(0.15)))
                         .animation(.smoothFallback(duration: 0.5), value: zoneColor)
                 }
             }
+            .frame(maxWidth: .infinity)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(width: 1, height: 40)
+
+            VStack(spacing: 4) {
+                let spo2Val  = ble.latestSpO2
+                let spo2Str  = spo2Val.map { "\(Int($0))%" } ?? "—"
+                let spo2Color: Color = (spo2Val ?? 100) < 90 ? .red : .white
+                Text(spo2Str)
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(spo2Color)
+                    .contentTransition(.numericText())
+                    .animation(.smoothFallback(), value: ble.latestSpO2)
+                Text("SPO₂")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.45))
+                    .kerning(2.0)
+                if let spo2 = spo2Val, spo2 < 90 {
+                    Text("LOW O₂")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.red)
+                        .kerning(1.5)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color.red.opacity(0.15)))
+                }
+            }
+            .frame(maxWidth: .infinity)
         }
-        .frame(width: 180, height: 200)
+    }
+
+    // MARK: - Sleep Ring
+
+    private var sleepRing: some View {
+        ZStack {
+            Circle()
+                .fill(sleepColor.opacity(ble.todaySleepMinutes == nil ? 0 : 0.14))
+                .frame(width: 100, height: 100)
+                .blur(radius: 18)
+            Circle()
+                .stroke(Color.white.opacity(0.08), lineWidth: 8)
+                .frame(width: 88, height: 88)
+            Circle()
+                .trim(from: 0, to: sleepProgress)
+                .stroke(
+                    AngularGradient(
+                        colors: [sleepColor.opacity(0.45), sleepColor, sleepColor.opacity(0.85)],
+                        center: .center, startAngle: .degrees(-90), endAngle: .degrees(270)
+                    ),
+                    style: StrokeStyle(lineWidth: 8, lineCap: .round)
+                )
+                .frame(width: 88, height: 88)
+                .rotationEffect(.degrees(-90))
+                .shadow(color: sleepColor.opacity(0.45), radius: 6)
+                .animation(.smoothFallback(duration: 0.6), value: sleepProgress)
+
+            VStack(spacing: 1) {
+                Text(ble.todaySleepMinutes != nil ? "\(sleepPct)%" : "—")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .foregroundStyle(sleepColor)
+                    .contentTransition(.numericText())
+                    .animation(.smoothFallback(), value: sleepPct)
+                Text(sleepSubtitle)
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.5))
+                Text("SLEEP")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(sleepColor.opacity(0.8))
+                    .kerning(1.2)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 120)
+    }
+
+    // MARK: - Strain Ring
+
+    private var strainRing: some View {
+        let band = strainTargetBand
+        let bandLo = band.lo / 21.0
+        let bandHi = band.hi / 21.0
+        return ZStack {
+            Circle()
+                .fill(strainColor.opacity(ble.todayStrain == nil ? 0 : 0.14))
+                .frame(width: 100, height: 100)
+                .blur(radius: 18)
+            Circle()
+                .stroke(Color.white.opacity(0.08), lineWidth: 8)
+                .frame(width: 88, height: 88)
+            // Target band arc
+            Circle()
+                .trim(from: bandLo, to: bandHi)
+                .stroke(Color.white.opacity(0.18), lineWidth: 8)
+                .frame(width: 88, height: 88)
+                .rotationEffect(.degrees(-90))
+            // Progress arc
+            Circle()
+                .trim(from: 0, to: strainProgress)
+                .stroke(
+                    AngularGradient(
+                        colors: [strainColor.opacity(0.45), strainColor, strainColor.opacity(0.85)],
+                        center: .center, startAngle: .degrees(-90), endAngle: .degrees(270)
+                    ),
+                    style: StrokeStyle(lineWidth: 8, lineCap: .round)
+                )
+                .frame(width: 88, height: 88)
+                .rotationEffect(.degrees(-90))
+                .shadow(color: strainColor.opacity(0.45), radius: 6)
+                .animation(.smoothFallback(duration: 0.6), value: strainProgress)
+
+            VStack(spacing: 1) {
+                Text(ble.todayStrain.map { String(format: "%.1f", $0) } ?? "—")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .foregroundStyle(strainColor)
+                    .contentTransition(.numericText())
+                    .animation(.smoothFallback(), value: ble.todayStrain)
+                Text(String(format: "%.0f–%.0f", band.lo, band.hi))
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.5))
+                Text("STRAIN")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(strainColor.opacity(0.8))
+                    .kerning(1.2)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 120)
     }
 
     // MARK: - Session Stats Bar
@@ -377,54 +504,43 @@ struct DashboardView: View {
 
     private var recoveryRing: some View {
         ZStack {
-            // Halo
             Circle()
-                .fill(recoveryColor.opacity(ble.recoveryScore == nil ? 0 : 0.18))
-                .frame(width: 180, height: 180)
-                .blur(radius: 24)
-            // Track
+                .fill(recoveryColor.opacity(ble.recoveryScore == nil ? 0 : 0.14))
+                .frame(width: 100, height: 100)
+                .blur(radius: 18)
             Circle()
-                .stroke(Color.white.opacity(0.08), lineWidth: 12)
-                .frame(width: 150, height: 150)
-            // Progress
+                .stroke(Color.white.opacity(0.08), lineWidth: 8)
+                .frame(width: 88, height: 88)
             Circle()
                 .trim(from: 0, to: recoveryProgress)
                 .stroke(
                     AngularGradient(
                         colors: [recoveryColor.opacity(0.45), recoveryColor, recoveryColor.opacity(0.85)],
-                        center: .center,
-                        startAngle: .degrees(-90),
-                        endAngle: .degrees(270)
+                        center: .center, startAngle: .degrees(-90), endAngle: .degrees(270)
                     ),
-                    style: StrokeStyle(lineWidth: 12, lineCap: .round)
+                    style: StrokeStyle(lineWidth: 8, lineCap: .round)
                 )
-                .frame(width: 150, height: 150)
+                .frame(width: 88, height: 88)
                 .rotationEffect(.degrees(-90))
-                .shadow(color: recoveryColor.opacity(0.5), radius: 8)
+                .shadow(color: recoveryColor.opacity(0.5), radius: 6)
                 .animation(.smoothFallback(duration: 0.6), value: recoveryProgress)
 
-            VStack(spacing: 2) {
-                Text(ble.recoveryScore.map { "\(Int($0))" } ?? "—")
-                    .font(.system(size: 44, weight: .bold, design: .rounded))
+            VStack(spacing: 1) {
+                Text(ble.recoveryScore.map { "\(Int($0))%" } ?? "—")
+                    .font(.system(size: 20, weight: .bold, design: .rounded))
                     .foregroundStyle(recoveryColor)
                     .contentTransition(.numericText())
                     .animation(.smoothFallback(), value: ble.recoveryScore)
-                Text("%")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.45))
-                    .kerning(2.5)
-                    .opacity(ble.recoveryScore == nil ? 0 : 1)
+                Text("—")
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                    .foregroundStyle(.clear)
                 Text("RECOVERY")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(recoveryColor)
-                    .kerning(1.5)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(recoveryColor.opacity(0.15)))
-                    .padding(.top, 2)
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(recoveryColor.opacity(0.8))
+                    .kerning(1.2)
             }
         }
-        .frame(width: 180, height: 200)
+        .frame(maxWidth: .infinity, minHeight: 120)
     }
 
     private var recoveryProgress: Double {

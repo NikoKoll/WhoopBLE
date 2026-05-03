@@ -119,9 +119,10 @@ final class SyncManager: ObservableObject {
         case 0xff where bytes.count == 28:
             guard bytes.count >= 10 else { break }
             let whoopTs = readU32LE(bytes, at: 6)
-            // Only update epoch offset from the most-recent (highest timestamp) packet — live data.
-            // Historical packets have lower timestamps and must not corrupt the offset.
-            if whoopTs > latestWhoopTs {
+            // Only derive epoch offset from small timestamps (WHOOP internal clock, < 1B).
+            // If rawTs > 1B it's already a Unix timestamp — computing offset from it yields ≈0
+            // which corrupts conversion of actual WHOOP-clock packets.
+            if whoopTs > latestWhoopTs && whoopTs < 1_000_000_000 {
                 latestWhoopTs = whoopTs
                 whoopToUnixOffset = Date().timeIntervalSince1970 - Double(whoopTs)
             }
@@ -440,20 +441,25 @@ final class SyncManager: ObservableObject {
 
         let tsAt: Int
         let hrAt: Int
+        let rrCountAt: Int
+        let rrDataAt: Int
         switch bytes[3] {
         case 0xff:
-            guard bytes.count >= 13 else { return nil }
-            tsAt = 6; hrAt = 12
+            // Layout: [ts@6 4B][??@10 2B][hr@12][rrCount@13][rrData@14 up to 9B]
+            guard bytes.count >= 14 else { return nil }
+            tsAt = 6; hrAt = 12; rrCountAt = 13; rrDataAt = 14
         case 0xf0:
+            // Layout: [counter@6 2B][ts@8 4B][??@12 4B][hr@16] — no RR data defined
             guard bytes.count >= 17 else { return nil }
-            tsAt = 8; hrAt = 16
+            tsAt = 8; hrAt = 16; rrCountAt = -1; rrDataAt = -1
         default:
             print("[SyncManager] parseChunk: unknown type 0x\(String(format: "%02x", bytes[3]))"); return nil
         }
         let rawTs = readU32LE(bytes, at: tsAt)
         let hr = Int(bytes[hrAt])
 
-        // 0xf0 chunks carry real Unix timestamps (> 1B); 0xff uses WHOOP internal clock.
+        // 0xf0 carries real Unix timestamps (> 1B). 0xff: RE docs say Unix, device logs say WHOOP
+        // clock — handle both via the > 1B heuristic.
         let unixTs: Double
         if rawTs > 1_000_000_000 {
             unixTs = Double(rawTs)
@@ -470,8 +476,22 @@ final class SyncManager: ObservableObject {
             print("[SyncManager] chunk rejected: hr=\(hr)"); return nil
         }
 
+        // Parse RR intervals from 0xff (same encoding as 0xa1: UInt16 LE ms, valid 300–2000).
+        var rrs: [Double] = []
+        if rrCountAt >= 0 && rrDataAt >= 0 && bytes.count > rrCountAt {
+            let rrCount = min(4, Int(bytes[rrCountAt]))
+            for i in 0..<rrCount {
+                let off = rrDataAt + i * 2
+                guard off + 1 < bytes.count else { break }
+                let ms = UInt16(bytes[off]) | (UInt16(bytes[off + 1]) << 8)
+                let secs = Double(ms) / 1000.0
+                if secs >= 0.3 && secs <= 2.0 { rrs.append(secs) }
+            }
+        }
+
         let timestamp = Date(timeIntervalSince1970: unixTs)
-        return HistoricalSample(timestamp: timestamp, heartRate: hr, accelerometer: nil)
+        return HistoricalSample(timestamp: timestamp, heartRate: hr, accelerometer: nil,
+                                rrIntervals: rrs.isEmpty ? nil : rrs)
     }
 
     // MARK: - Persistence

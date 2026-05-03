@@ -89,6 +89,12 @@ final class BLEManager: NSObject, ObservableObject {
     // is bucketed into today's UTC row (post-midnight HR samples), so the freshest score is
     // typically today's; falls back to the latest prior day with a non-nil value.
     @Published var recoveryScore: Double? = nil
+    // Daily strain (0–21), sleep duration (minutes), and sleep need (minutes) from DailyMetricsStore.
+    @Published var todayStrain: Double? = nil
+    @Published var todaySleepMinutes: Int? = nil
+    @Published var todaySleepNeedMinutes: Int? = nil
+    // Most recent SpO2 reading (%) from HealthKit, nil if no sample in last 24h.
+    @Published var latestSpO2: Double? = nil
 
     // HealthKit capability flags (§9.11) — refreshed after authorization.
     @Published var hkRespRateAvailable = false
@@ -211,6 +217,7 @@ final class BLEManager: NSObject, ObservableObject {
         hkRespRateAvailable = await resp
         hkSpO2Available     = await spo2
         hkAppleWatchPaired  = await watch
+        latestSpO2 = await healthKit.readLatestSpO2()
 
         // One-time workout fragment migration
         let migrator = WorkoutMigrator(store: healthKit.store)
@@ -222,16 +229,37 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// Reloads the published recovery score from DailyMetricsStore, picking the most recent
-    /// day with a non-nil value. Today's row is preferred (sleep ending this morning lands
-    /// there); falls back to the latest prior day. Always assigns on the MainActor.
+    /// Reloads published daily metrics from DailyMetricsStore: recovery, strain, sleep.
+    /// Recovery: most recent non-nil (any day). Strain + sleep: today or yesterday only.
     func refreshRecoveryFromStore() async {
         let all = await dailyMetrics.loadAll()
-        let score = all
-            .sorted { $0.date > $1.date }
-            .first(where: { $0.recoveryScore != nil })?
-            .recoveryScore
-        await MainActor.run { self.recoveryScore = score }
+        let sorted = all.sorted { $0.date > $1.date }
+
+        // Recovery: fall back across days (morning lock-in may lag by a day).
+        let score = sorted.first(where: { $0.recoveryScore != nil })?.recoveryScore
+
+        // Strain + sleep: only current or previous calendar day — stale days are misleading.
+        var utcCal = Calendar(identifier: .gregorian)
+        utcCal.timeZone = TimeZone(identifier: "UTC")!
+        let now = Date()
+        func isoKey(_ d: Date) -> String {
+            let c = utcCal.dateComponents([.year, .month, .day], from: d)
+            return String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
+        }
+        let todayKey     = isoKey(now)
+        let yesterdayKey = isoKey(now.addingTimeInterval(-86400))
+        let recent = sorted.filter { $0.date == todayKey || $0.date == yesterdayKey }
+
+        let strain    = recent.first(where: { $0.strainScore      != nil })?.strainScore
+        let sleepMin  = recent.first(where: { $0.sleepMinutes     != nil })?.sleepMinutes
+        let sleepNeed = recent.first(where: { $0.sleepNeedMinutes != nil })?.sleepNeedMinutes
+
+        await MainActor.run {
+            self.recoveryScore         = score
+            self.todayStrain           = strain
+            self.todaySleepMinutes     = sleepMin
+            self.todaySleepNeedMinutes = sleepNeed
+        }
     }
 
     private func parseISODateString(_ str: String) -> Date? {
@@ -623,8 +651,8 @@ extension BLEManager: CBPeripheralDelegate {
             while !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { return }
                 guard let self, let p = self.peripheral, let c = self.cmdToStrap else { return }
-                self.bleQueue.async { p.writeValue(WhoopCRC.enableHealth, for: c, type: .withoutResponse) }
-                print("💓 heartbeat sent")
+                self.bleQueue.async { p.writeValue(WhoopCRC.keepaliveHealth, for: c, type: .withoutResponse) }
+                print("💓 keepalive sent")
             }
         }
 
