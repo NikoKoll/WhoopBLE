@@ -176,7 +176,11 @@ final class SleepDetector {
                 merged.append(seg)
             }
         }
-        return SleepSession(start: windows[s].start, end: windows[e].end, stages: merged)
+        // Awake windows within the sleep period count as brief wakes.
+        let awakeCount = (s...e).filter { stages[$0] == .awake }.count
+        let briefWakeSecs = awakeCount * Int(windowSize)
+        return SleepSession(start: windows[s].start, end: windows[e].end, stages: merged,
+                            briefWakeCount: awakeCount, briefWakeTotalSeconds: briefWakeSecs)
     }
 
     // MARK: - Merge nearby sessions
@@ -194,7 +198,13 @@ final class SleepDetector {
                 case (nil, let b?):    mergedStages = b
                 default:               mergedStages = nil
                 }
-                cur = SleepSession(start: cur.start, end: max(cur.end, next.end), stages: mergedStages)
+                cur = SleepSession(
+                    start: cur.start,
+                    end: max(cur.end, next.end),
+                    stages: mergedStages,
+                    briefWakeCount: cur.briefWakeCount + next.briefWakeCount,
+                    briefWakeTotalSeconds: cur.briefWakeTotalSeconds + next.briefWakeTotalSeconds
+                )
             } else {
                 out.append(cur)
                 cur = next

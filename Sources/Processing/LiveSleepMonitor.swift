@@ -10,11 +10,15 @@ import Foundation
 @MainActor
 final class LiveSleepMonitor {
 
-    private enum State { case awake, candidate, sleeping }
+    private enum State { case awake, candidate, sleeping, briefWake }
     private var state: State = .awake
     private var candidateStart: Date?
     private var sleepOnset: Date?
-    private var wakeCandidate: Date?
+
+    // briefWake sub-state tracking
+    private var briefWakeStart: Date?
+    private var briefWakeCount: Int = 0
+    private var briefWakeTotalSecs: Double = 0
 
     // ~4-minute rolling HR buffer (240 samples at 1 Hz).
     // avg + min of this window drive the sleep signal.
@@ -39,7 +43,7 @@ final class LiveSleepMonitor {
         step(at: metrics.timestamp)
     }
 
-    // MARK: - State machine (§2.3)
+    // MARK: - State machine (§2.3 + brief wake sub-state)
 
     private func step(at now: Date) {
         let avg = hrBuffer.reduce(0, +) / Double(hrBuffer.count)
@@ -63,25 +67,53 @@ final class LiveSleepMonitor {
             } else if let cs = candidateStart, now.timeIntervalSince(cs) >= candidateDuration {
                 sleepOnset = cs
                 state = .sleeping
-                wakeCandidate = nil
-                print("[LiveSleep] onset \(cs.formatted(date: .omitted, time: .shortened))")
+                briefWakeCount = 0; briefWakeTotalSecs = 0; briefWakeStart = nil
+                let isoFmt = ISO8601DateFormatter()
+                print("[Sleep] session opened onset=\(isoFmt.string(from: cs))")
             }
 
         case .sleeping:
             if sleepLike {
-                wakeCandidate = nil
+                // All good, remain sleeping.
+                break
             } else {
-                if wakeCandidate == nil { wakeCandidate = now }
-                // Require 5 min of non-sleep conditions to confirm wake.
-                if let wc = wakeCandidate, now.timeIntervalSince(wc) >= 300 {
-                    if let onset = sleepOnset {
-                        let session = SleepSession(start: onset, end: wc)
-                        print("[LiveSleep] wake \(wc.formatted(date: .omitted, time: .shortened))")
-                        onSessionEnd?(session)
-                    }
-                    state = .awake
-                    sleepOnset = nil; wakeCandidate = nil; candidateStart = nil
+                // Conditions broke — enter brief wake sub-state.
+                briefWakeStart = now
+                state = .briefWake
+                print("[Sleep] brief wake detected at \(now.formatted(date: .omitted, time: .shortened))")
+            }
+
+        case .briefWake:
+            if sleepLike {
+                // Conditions restored — absorb as brief wake.
+                if let bws = briefWakeStart {
+                    let dur = now.timeIntervalSince(bws)
+                    briefWakeTotalSecs += dur
+                    briefWakeCount += 1
+                    let durMins = Int(dur / 60)
+                    print("[Sleep] brief wake absorbed (under 10min threshold) duration=\(durMins)m interruption_count=\(briefWakeCount)")
                 }
+                briefWakeStart = nil
+                state = .sleeping
+            } else if let bws = briefWakeStart, now.timeIntervalSince(bws) >= 600 {
+                // Sustained 10-min wake — finalize session.
+                if let onset = sleepOnset {
+                    let sessionDurSecs = Int(bws.timeIntervalSince(onset))
+                    let h = sessionDurSecs / 3600; let m = (sessionDurSecs % 3600) / 60
+                    let sleepSecs = sessionDurSecs - Int(briefWakeTotalSecs)
+                    let efficiency = sessionDurSecs > 0 ? Double(sleepSecs) / Double(sessionDurSecs) : 0
+                    print("[Sleep] session finalized duration=\(h)h\(m)m brief_wakes=\(briefWakeCount) efficiency=\(String(format: "%.2f", efficiency))")
+                    let session = SleepSession(
+                        start: onset,
+                        end: bws,
+                        briefWakeCount: briefWakeCount,
+                        briefWakeTotalSeconds: Int(briefWakeTotalSecs)
+                    )
+                    onSessionEnd?(session)
+                }
+                state = .awake
+                sleepOnset = nil; candidateStart = nil
+                briefWakeStart = nil; briefWakeCount = 0; briefWakeTotalSecs = 0
             }
         }
     }

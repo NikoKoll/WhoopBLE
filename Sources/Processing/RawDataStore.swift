@@ -60,6 +60,21 @@ actor RawDataStore {
         }
     }
 
+    /// Historical RR from batch sync — no throttle; validates range; deduplicates by timestamp.
+    func appendRRBatch(_ samples: [(timestamp: Int, intervalMs: Int)]) {
+        let bufferedTimestamps = Set(rrBuffer.map { $0.sample.timestamp })
+        var added = 0
+        for s in samples {
+            guard s.intervalMs >= 300, s.intervalMs <= 2000 else { continue }
+            guard !bufferedTimestamps.contains(s.timestamp) else { continue }
+            rrBuffer.append((isoDate(from: s.timestamp), RRSample(timestamp: s.timestamp, intervalMs: s.intervalMs)))
+            added += 1
+        }
+        if added > 0 {
+            print("[Raw] appendRRBatch: \(added)/\(samples.count) RR intervals added")
+        }
+    }
+
     /// Returns on-disk samples + pending buffer for the date, sorted by timestamp.
     func loadHR(for date: Date) -> [HRSample] {
         let key = isoDate(for: date)

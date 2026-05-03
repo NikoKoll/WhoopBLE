@@ -20,7 +20,7 @@ final class WorkoutSessionAggregator {
     private let exerciseMETThreshold: Double = 3.0
     private let openSec: TimeInterval = 60
     private let cooldownSec: TimeInterval = 300
-    private let minWorkoutSec: TimeInterval = 60
+    private let minWorkoutSec: TimeInterval = 300
 
     private(set) var isSessionActive = false
     private var sessionStart: Date?
@@ -99,7 +99,7 @@ final class WorkoutSessionAggregator {
             print("[Session] close discarded dur=\(Int(dur))s kcal=\(String(format: "%.1f", kcal))")
             return
         }
-        print("[Session] close start=\(start) end=\(end) dur=\(String(format: "%.1f", dur/60))min kcal=\(String(format: "%.1f", kcal)) avgMET=\(String(format: "%.2f", avgMET)) type=\(activity.rawValue)")
+        print("[Workout] session finalized writing single HKWorkout duration=\(String(format: "%.0f", dur/60))m energy=\(String(format: "%.0f", kcal))kcal samples=\(buf.count) type=\(activity.rawValue)")
 
         let energyBuckets = bucketEnergy(buf: buf, start: start, end: end)
         let hrSamples = buf.map { (ts: $0.ts, bpm: $0.hr) }

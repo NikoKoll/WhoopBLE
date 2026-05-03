@@ -1,6 +1,7 @@
 import CoreBluetooth
 import CoreMotion
 import Combine
+import HealthKit
 
 // Active MET above resting (BMR excluded). Continuous curve so sedentary HR still credits Move ring.
 // metTotal = 1.0 + max(0, (pct - 0.30) * 14), capped at 11. metActive = metTotal - 1.0.
@@ -83,6 +84,16 @@ final class BLEManager: NSObject, ObservableObject {
     let rawDataStore   = RawDataStore()
     let dailyMetrics   = DailyMetricsStore()
     let recomputeQueue = RecomputeQueue()
+
+    // Most recent recovery score (0–100) from DailyMetricsStore. Sleep that ends this morning
+    // is bucketed into today's UTC row (post-midnight HR samples), so the freshest score is
+    // typically today's; falls back to the latest prior day with a non-nil value.
+    @Published var recoveryScore: Double? = nil
+
+    // HealthKit capability flags (§9.11) — refreshed after authorization.
+    @Published var hkRespRateAvailable = false
+    @Published var hkSpO2Available     = false
+    @Published var hkAppleWatchPaired  = false
 
     // Live step count from CMPedometer — today's total, refreshed in real time.
     @Published var dailySteps: Int = 0
@@ -170,14 +181,57 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func checkVersionMismatch() async {
-        let staleHRV    = await dailyMetrics.datesNeedingRecompute(metric: "hrv",    below: AlgoVersions.hrv)
-        let staleStrain = await dailyMetrics.datesNeedingRecompute(metric: "strain", below: AlgoVersions.strain)
-        let staleSleep  = await dailyMetrics.datesNeedingRecompute(metric: "sleep",  below: AlgoVersions.sleep)
-        let allKeys = Set(staleHRV + staleStrain + staleSleep)
-        guard !allKeys.isEmpty else { return }
+        // Load whatever is already persisted — shown immediately while recompute runs.
+        await refreshRecoveryFromStore()
+
+        let staleHRV      = await dailyMetrics.datesNeedingRecompute(metric: "hrv",      below: AlgoVersions.hrv)
+        let staleStrain   = await dailyMetrics.datesNeedingRecompute(metric: "strain",   below: AlgoVersions.strain)
+        let staleSleep    = await dailyMetrics.datesNeedingRecompute(metric: "sleep",    below: AlgoVersions.sleep)
+        let staleRecovery = await dailyMetrics.datesNeedingRecompute(metric: "recovery", below: AlgoVersions.recovery)
+        // Always include today — a missing row (no prior recompute yet) would otherwise be skipped.
+        var utcCal = Calendar(identifier: .gregorian)
+        utcCal.timeZone = TimeZone(identifier: "UTC")!
+        let c = utcCal.dateComponents([.year, .month, .day], from: Date())
+        let todayKey = String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
+        let allKeys = Set(staleHRV + staleStrain + staleSleep + staleRecovery + [todayKey])
         let dates = allKeys.compactMap { parseISODateString($0) }
-        await recomputeQueue.enqueue(dates: dates, rawStore: rawDataStore, dailyStore: dailyMetrics)
-        print("[BLEManager] version mismatch: enqueued \(dates.count) date(s) for recompute")
+        print("[BLEManager] enqueuing \(dates.count) date(s) for recompute")
+        await recomputeQueue.configure(healthKit: healthKit)
+        await recomputeQueue.enqueue(dates: dates, rawStore: rawDataStore, dailyStore: dailyMetrics) {
+            [weak self] in
+            await self?.refreshRecoveryFromStore()
+        }
+    }
+
+    /// Refresh HealthKit capability flags and run one-time workout migration.
+    func refreshCapabilities() async {
+        async let resp  = healthKit.hasRecentSamples(HKQuantityType(.respiratoryRate))
+        async let spo2  = healthKit.hasRecentSamples(HKQuantityType(.oxygenSaturation))
+        async let watch = healthKit.appleWatchPaired()
+        hkRespRateAvailable = await resp
+        hkSpO2Available     = await spo2
+        hkAppleWatchPaired  = await watch
+
+        // One-time workout fragment migration
+        let migrator = WorkoutMigrator(store: healthKit.store)
+        let affectedDates = await migrator.migrateIfNeeded()
+        if !affectedDates.isEmpty {
+            let dates = affectedDates.compactMap { parseISODateString($0) }
+            await recomputeQueue.configure(healthKit: healthKit)
+            await recomputeQueue.enqueue(dates: dates, rawStore: rawDataStore, dailyStore: dailyMetrics)
+        }
+    }
+
+    /// Reloads the published recovery score from DailyMetricsStore, picking the most recent
+    /// day with a non-nil value. Today's row is preferred (sleep ending this morning lands
+    /// there); falls back to the latest prior day. Always assigns on the MainActor.
+    func refreshRecoveryFromStore() async {
+        let all = await dailyMetrics.loadAll()
+        let score = all
+            .sorted { $0.date > $1.date }
+            .first(where: { $0.recoveryScore != nil })?
+            .recoveryScore
+        await MainActor.run { self.recoveryScore = score }
     }
 
     private func parseISODateString(_ str: String) -> Date? {

@@ -12,6 +12,7 @@ struct WhoopBLEApp: App {
                 .preferredColorScheme(.dark)
                 .task {
                     await bleManager.healthKit.requestAuthorization()
+                    await bleManager.refreshCapabilities()
                     await bleManager.checkVersionMismatch()
                 }
                 .onChange(of: scenePhase) { newPhase in

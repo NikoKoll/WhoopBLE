@@ -1,4 +1,5 @@
 import Foundation
+import HealthKit
 
 /// Deduplicating background queue for day recomputation.
 /// Accepts date strings, deduplicates, drains serially at background priority.
@@ -8,12 +9,26 @@ actor RecomputeQueue {
     private var isRunning:  Bool = false
     private var rawStore:   RawDataStore?
     private var dailyStore: DailyMetricsStore?
+    private var healthKit:  HealthKitWriter?
     private let recomputer  = DayRecomputer()
+    private var onComplete: [@Sendable () async -> Void] = []
+
+    /// Inject HealthKitWriter so recomputeDay can use HK fallback reads.
+    func configure(healthKit: HealthKitWriter) {
+        self.healthKit = healthKit
+    }
 
     /// Enqueue one or more dates. Starts drain loop if not already running.
-    func enqueue(dates: [Date], rawStore: RawDataStore, dailyStore: DailyMetricsStore) {
+    /// `completion` fires on the caller's context after drain finishes (or immediately if idle).
+    func enqueue(
+        dates: [Date],
+        rawStore: RawDataStore,
+        dailyStore: DailyMetricsStore,
+        completion: (@Sendable () async -> Void)? = nil
+    ) {
         self.rawStore   = rawStore
         self.dailyStore = dailyStore
+        if let c = completion { self.onComplete.append(c) }
         for date in dates { pending.insert(isoDate(for: date)) }
         print("[Recompute] queued \(dates.count) date(s) — pending=\(pending.count)")
         guard !isRunning else { return }
@@ -32,10 +47,13 @@ actor RecomputeQueue {
                   let raw = rawStore,
                   let daily = dailyStore else { continue }
             print("[Recompute] processing \(key)")
-            await recomputer.recomputeDay(date: date, rawStore: raw, dailyStore: daily)
+            await recomputer.recomputeDay(date: date, rawStore: raw, dailyStore: daily, healthKit: healthKit)
         }
         isRunning = false
         print("[RecomputeQueue] drain complete")
+        let callbacks = onComplete
+        onComplete = []
+        for cb in callbacks { await cb() }
     }
 
     // MARK: - Date helpers

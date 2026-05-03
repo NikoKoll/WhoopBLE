@@ -75,7 +75,8 @@ struct TrendsView: View {
     // MARK: - Today
 
     private var todayView: some View {
-        let entries = todayEntries
+        let rawEntries = todayEntries
+        let entries = downsample(rawEntries)
         let hrvEntries = entries.compactMap { e -> (entry: MetricsStore.Entry, hrv: Double)? in
             guard let hrv = e.hrv else { return nil }
             return (e, hrv)
@@ -112,12 +113,12 @@ struct TrendsView: View {
                                 .foregroundStyle(.linearGradient(
                                     colors: [.cyan.opacity(0.3), .clear],
                                     startPoint: .top, endPoint: .bottom))
-                                .interpolationMethod(.monotone)
+                                .interpolationMethod(.linear)
                             LineMark(x: .value("Time", e.timestamp),
                                      y: .value("HR", e.heartRate))
                                 .foregroundStyle(.cyan)
                                 .lineStyle(StrokeStyle(lineWidth: 2))
-                                .interpolationMethod(.monotone)
+                                .interpolationMethod(.linear)
                         }
                         .chartXScale(domain: today...tomorrow)
                         .chartYScale(domain: hrDomain(entries.map(\.heartRate)))
@@ -144,7 +145,7 @@ struct TrendsView: View {
                                      y: .value("HRV", item.hrv))
                                 .foregroundStyle(.purple)
                                 .lineStyle(StrokeStyle(lineWidth: 2))
-                                .interpolationMethod(.monotone)
+                                .interpolationMethod(.linear)
                             PointMark(x: .value("Time", item.entry.timestamp),
                                       y: .value("HRV", item.hrv))
                                 .foregroundStyle(.purple)
@@ -175,33 +176,23 @@ struct TrendsView: View {
         let xDomain = weekStart...weekEnd
 
         return VStack(spacing: 16) {
-            // HR bar chart
+            // HR rows — one row per day; horizontal bar + label + value.
+            // Replaces BarMark chart whose `.annotation(position:.bottom)` weekday
+            // labels rendered inside plot and overlapped bars.
             card {
                 VStack(alignment: .leading, spacing: 10) {
                     label("DAILY AVG HEART RATE")
-                    if !hrS.isEmpty {
-                        Chart(hrS) { s in
-                            BarMark(x: .value("Day", s.id, unit: .day),
-                                    y: .value("HR", s.avgHR))
-                                .foregroundStyle(zoneColor(s.avgHR).gradient)
-                                .cornerRadius(4)
-                                .annotation(position: .bottom, alignment: .center, spacing: 4) {
-                                    Text(s.id, format: .dateTime.weekday(.abbreviated))
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundStyle(.gray)
-                                }
-                        }
-                        .chartXScale(domain: xDomain)
-                        .chartYScale(domain: hrDomain(hrS.map(\.avgHR)))
-                        .chartXAxis(.hidden)
-                        .chartYAxis { hrYAxis }
-                        .chartLegend(.hidden)
-                        .chartBackground { _ in Color.clear }
-                        .chartPlotStyle { $0.background(Color.clear) }
-                        .frame(height: 165)
-                        .accessibilityLabel("Daily average heart rate for the past 7 days")
-                    } else {
+                    if hrS.isEmpty {
                         emptyState(icon: "heart", height: 150)
+                    } else {
+                        let maxHR = max(Double(hrS.map(\.avgHR).max() ?? 100), 80)
+                        VStack(spacing: 8) {
+                            ForEach(weekDayList(), id: \.self) { day in
+                                let entry = hrS.first { cal.isDate($0.id, inSameDayAs: day) }
+                                hrRow(day: day, hr: entry?.avgHR, maxHR: maxHR)
+                            }
+                        }
+                        .accessibilityLabel("Daily average heart rate for the past 7 days")
                     }
                 }
             }
@@ -217,12 +208,12 @@ struct TrendsView: View {
                                 .foregroundStyle(.linearGradient(
                                     colors: [.purple.opacity(0.3), .clear],
                                     startPoint: .top, endPoint: .bottom))
-                                .interpolationMethod(.monotone)
+                                .interpolationMethod(.linear)
                             LineMark(x: .value("Day", s.id, unit: .day),
                                      y: .value("HRV", s.avgHRV!))
                                 .foregroundStyle(.purple)
                                 .lineStyle(StrokeStyle(lineWidth: 2))
-                                .interpolationMethod(.monotone)
+                                .interpolationMethod(.linear)
                             PointMark(x: .value("Day", s.id, unit: .day),
                                       y: .value("HRV", s.avgHRV!))
                                 .foregroundStyle(.purple)
@@ -408,5 +399,62 @@ struct TrendsView: View {
         case ..<170: return .orange
         default:     return .red
         }
+    }
+
+    // MARK: - Week HR rows
+
+    private func weekDayList() -> [Date] {
+        (0..<7).compactMap { cal.date(byAdding: .day, value: $0, to: weekStart) }
+    }
+
+    private func hrRow(day: Date, hr: Int?, maxHR: Double) -> some View {
+        let isToday = cal.isDate(day, inSameDayAs: today)
+        let frac: Double = hr.map { min(1, Double($0) / (maxHR * 1.05)) } ?? 0
+        return HStack(spacing: 12) {
+            Text(day, format: .dateTime.weekday(.abbreviated))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(isToday ? .cyan : .gray)
+                .frame(width: 36, alignment: .leading)
+
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.06))
+                    if let hr {
+                        Capsule()
+                            .fill(zoneColor(hr).gradient)
+                            .frame(width: max(6, geo.size.width * frac))
+                    }
+                }
+            }
+            .frame(height: 10)
+
+            Text(hr.map { "\($0)" } ?? "—")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(hr != nil ? .white : .white.opacity(0.3))
+                .frame(width: 32, alignment: .trailing)
+                .monospacedDigit()
+        }
+    }
+
+    // MARK: - Downsampling
+
+    // Bucket-average to ≤ targetCount points so Chart doesn't stall on thousands of marks.
+    private func downsample(_ entries: [MetricsStore.Entry], max targetCount: Int = 180) -> [MetricsStore.Entry] {
+        guard entries.count > targetCount else { return entries }
+        let bucket = Int(ceil(Double(entries.count) / Double(targetCount)))
+        var out: [MetricsStore.Entry] = []
+        out.reserveCapacity(targetCount + 1)
+        var i = 0
+        while i < entries.count {
+            let slice = entries[i..<min(i + bucket, entries.count)]
+            let avgHR = slice.map(\.heartRate).reduce(0, +) / slice.count
+            let hrvVals = slice.compactMap(\.hrv)
+            let avgHRV: Double? = hrvVals.isEmpty ? nil : hrvVals.reduce(0, +) / Double(hrvVals.count)
+            let midTs = slice[slice.startIndex.advanced(by: slice.count / 2)].timestamp
+            out.append(MetricsStore.Entry(timestamp: midTs, heartRate: avgHR, hrv: avgHRV))
+            i += bucket
+        }
+        return out
     }
 }

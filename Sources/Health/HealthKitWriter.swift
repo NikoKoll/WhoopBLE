@@ -2,7 +2,8 @@ import HealthKit
 
 @MainActor
 final class HealthKitWriter {
-    private let store = HKHealthStore()
+    // Internal so WorkoutMigrator can reuse the same store instance.
+    let store = HKHealthStore()
     private var lastWriteDate: Date = .distantPast
 
     func requestAuthorization() async {
@@ -17,9 +18,103 @@ final class HealthKitWriter {
         ]
         let read: Set<HKObjectType> = [
             HKQuantityType(.heartRate),
-            HKCategoryType(.sleepAnalysis)
+            HKQuantityType(.heartRateVariabilitySDNN),
+            HKQuantityType(.restingHeartRate),
+            HKQuantityType(.respiratoryRate),
+            HKQuantityType(.oxygenSaturation),
+            HKQuantityType(.bodyTemperature),
+            HKCategoryType(.sleepAnalysis),
+            HKObjectType.workoutType()
         ]
         try? await store.requestAuthorization(toShare: share, read: read)
+
+        // Log grant/deny status per §10.8 (iOS returns determined states only after first prompt).
+        let labels: [(HKObjectType, String)] = [
+            (HKQuantityType(.heartRateVariabilitySDNN), "hrv"),
+            (HKQuantityType(.restingHeartRate),         "rhr"),
+            (HKQuantityType(.respiratoryRate),          "resp"),
+            (HKQuantityType(.oxygenSaturation),         "spo2"),
+            (HKQuantityType(.bodyTemperature),          "bodytemp"),
+            (HKCategoryType(.sleepAnalysis),            "sleep"),
+        ]
+        var granted: [String] = []
+        var denied:  [String] = []
+        for (type, label) in labels {
+            switch store.authorizationStatus(for: type) {
+            case .sharingAuthorized:    granted.append(label)
+            case .sharingDenied:        denied.append(label)
+            default: break
+            }
+        }
+        if !granted.isEmpty { print("[HealthKit] authorization granted for: \(granted.joined(separator: ","))") }
+        if !denied.isEmpty  { print("[HealthKit] authorization denied for: \(denied.joined(separator: ","))") }
+    }
+
+    // MARK: - Capability checks (§9.11)
+
+    /// Returns true when at least one sample of `type` exists in the last `lookback` seconds.
+    func hasRecentSamples(_ type: HKSampleType, lookback: TimeInterval = 7 * 86400) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let end   = Date()
+            let start = end.addingTimeInterval(-lookback)
+            let pred  = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+            let q = HKSampleQuery(sampleType: type, predicate: pred, limit: 1,
+                                  sortDescriptors: nil) { _, samples, _ in
+                cont.resume(returning: !(samples?.isEmpty ?? true))
+            }
+            store.execute(q)
+        }
+    }
+
+    /// Returns true if any activeEnergyBurned sample in the last 7 days came from an Apple Watch source.
+    func appleWatchPaired() async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let type  = HKQuantityType(.activeEnergyBurned)
+            let end   = Date()
+            let start = end.addingTimeInterval(-7 * 86400)
+            let pred  = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+            let q = HKSampleQuery(sampleType: type, predicate: pred, limit: 100,
+                                  sortDescriptors: nil) { _, samples, _ in
+                let found = samples?.contains { s in
+                    let name   = s.sourceRevision.source.name.lowercased()
+                    let bundle = s.sourceRevision.source.bundleIdentifier.lowercased()
+                    return name.contains("watch") || bundle.contains("com.apple.health.")
+                } ?? false
+                cont.resume(returning: found)
+            }
+            store.execute(q)
+        }
+    }
+
+    // MARK: - Fallback readers (source fusion for DayRecomputer)
+
+    /// Most recent restingHeartRate sample within ±1 day of `date`.
+    func readLatestRHR(for date: Date) async -> Double? {
+        await readLatestQuantity(HKQuantityType(.restingHeartRate),
+                                 unit: HKUnit.count().unitDivided(by: .minute()),
+                                 for: date)
+    }
+
+    /// Most recent heartRateVariabilitySDNN sample within ±1 day of `date` (converted ms → ms).
+    func readLatestHRV(for date: Date) async -> Double? {
+        guard let raw = await readLatestQuantity(HKQuantityType(.heartRateVariabilitySDNN),
+                                                 unit: .second(), for: date) else { return nil }
+        return raw * 1000.0  // HK stores in seconds; app uses milliseconds
+    }
+
+    private func readLatestQuantity(_ type: HKQuantityType, unit: HKUnit, for date: Date) async -> Double? {
+        await withCheckedContinuation { (cont: CheckedContinuation<Double?, Never>) in
+            let start = date.addingTimeInterval(-86400)
+            let end   = date.addingTimeInterval(86400)
+            let pred  = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate)
+            let sort  = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
+            let q = HKSampleQuery(sampleType: type, predicate: pred, limit: 1,
+                                  sortDescriptors: [sort]) { _, samples, _ in
+                let value = (samples?.first as? HKQuantitySample)?.quantity.doubleValue(for: unit)
+                cont.resume(returning: value)
+            }
+            store.execute(q)
+        }
     }
 
     // MARK: - Live HR (throttled to 5-second minimum interval)
@@ -191,44 +286,35 @@ final class HealthKitWriter {
     }
 
     // MARK: - Sleep analysis
-    // If `stages` are present, emit per-stage HKCategorySamples (asleepDeep/Core/REM/awake).
-    // Otherwise fall back to one asleepUnspecified sample per session.
+    // Writes ONE asleepUnspecified HKCategorySample per session (full window).
+    // Per-stage writing was removed — it produced one Health entry per stage segment,
+    // causing the night to appear as multiple fragmented entries.
     func writeSleep(_ sessions: [SleepSession]) {
         guard !sessions.isEmpty else { return }
-        let maxSleepDuration: TimeInterval = 86400
-        let now = Date()
         let type = HKCategoryType(.sleepAnalysis)
-        var samples: [HKSample] = []
+        let now = Date()
 
         for session in sessions {
             let start = session.start
-            let end   = min(session.end, start.addingTimeInterval(maxSleepDuration))
+            let end   = session.end
             guard end > start, end <= now.addingTimeInterval(3600) else {
                 print("[HealthKit] sleep session skipped: invalid range \(start) → \(end)")
                 continue
             }
-            if let stages = session.stages, !stages.isEmpty {
-                for seg in stages {
-                    guard seg.end > seg.start, seg.end <= end.addingTimeInterval(60) else { continue }
-                    let value: HKCategoryValueSleepAnalysis = {
-                        switch seg.stage {
-                        case .deep:  return .asleepDeep
-                        case .core:  return .asleepCore
-                        case .rem:   return .asleepREM
-                        case .awake: return .awake
-                        }
-                    }()
-                    samples.append(HKCategorySample(type: type, value: value.rawValue, start: seg.start, end: seg.end))
+            let metadata: [String: Any] = [HKMetadataKeyTimeZone: TimeZone.current.identifier]
+            let sample = HKCategorySample(
+                type: type,
+                value: HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
+                start: start, end: end,
+                metadata: metadata
+            )
+            store.save(sample) { @Sendable _, error in
+                if let error {
+                    print("[Sleep] HK write failed: \(error.localizedDescription) — SLEEP_HK_WRITE_FAILED")
+                } else {
+                    print("[Sleep] HK sample written for date=\(start)")
                 }
-            } else {
-                samples.append(HKCategorySample(type: type, value: HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue, start: start, end: end))
             }
-        }
-
-        guard !samples.isEmpty else { return }
-        store.save(samples) { @Sendable _, error in
-            if let error { print("[HealthKit] sleep write error: \(error.localizedDescription)") }
-            else { print("[HealthKit] wrote \(samples.count) sleep sample(s)") }
         }
     }
 }

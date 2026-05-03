@@ -52,19 +52,28 @@ struct SleepSession: Sendable, Codable {
     let start: Date
     let end: Date
     let stages: [SleepStageSegment]?
+    let briefWakeCount: Int
+    let briefWakeTotalSeconds: Int
 
-    init(start: Date, end: Date, stages: [SleepStageSegment]? = nil) {
+    init(start: Date, end: Date, stages: [SleepStageSegment]? = nil,
+         briefWakeCount: Int = 0, briefWakeTotalSeconds: Int = 0) {
         self.start = start
         self.end = end
         self.stages = stages
+        self.briefWakeCount = briefWakeCount
+        self.briefWakeTotalSeconds = briefWakeTotalSeconds
     }
 
-    // Custom decoder so legacy persisted sessions (no `stages` key) still decode.
-    private enum CodingKeys: String, CodingKey { case start, end, stages }
+    // Custom decoder — legacy persisted sessions missing new keys decode to defaults.
+    private enum CodingKeys: String, CodingKey {
+        case start, end, stages, briefWakeCount, briefWakeTotalSeconds
+    }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.start = try c.decode(Date.self, forKey: .start)
         self.end = try c.decode(Date.self, forKey: .end)
         self.stages = try c.decodeIfPresent([SleepStageSegment].self, forKey: .stages)
+        self.briefWakeCount = (try? c.decodeIfPresent(Int.self, forKey: .briefWakeCount)) ?? 0
+        self.briefWakeTotalSeconds = (try? c.decodeIfPresent(Int.self, forKey: .briefWakeTotalSeconds)) ?? 0
     }
 }

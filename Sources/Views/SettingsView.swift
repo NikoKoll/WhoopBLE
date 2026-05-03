@@ -1,7 +1,20 @@
 import SwiftUI
 
+private struct CapabilityRow: View {
+    let label: String
+    let available: Bool
+    init(_ label: String, available: Bool) { self.label = label; self.available = available }
+    var body: some View {
+        LabeledContent(label) {
+            Image(systemName: available ? "checkmark.circle.fill" : "xmark.circle")
+                .foregroundStyle(available ? .green : .secondary)
+        }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var ble: BLEManager
+    @Environment(\.openURL) private var openURL
     @State private var showClearConfirm = false
     @AppStorage("userWeightKg") private var userWeightKg: Double = 78
 
@@ -52,6 +65,16 @@ struct SettingsView: View {
                         .frame(width: 80)
                     Text("kg").foregroundStyle(.secondary)
                 }
+            }
+
+            Section("HealthKit Access") {
+                CapabilityRow("Resp. Rate",   available: ble.hkRespRateAvailable)
+                CapabilityRow("SpO₂",         available: ble.hkSpO2Available)
+                CapabilityRow("Apple Watch",  available: ble.hkAppleWatchPaired)
+                Button("Manage in Health App") {
+                    if let url = URL(string: "x-apple-health://") { openURL(url) }
+                }
+                .foregroundStyle(.blue)
             }
 
             Section("Data") {

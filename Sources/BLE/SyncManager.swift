@@ -48,6 +48,7 @@ final class SyncManager: ObservableObject {
     init() {
         loadProcessedBatches()
         loadSleepSessions()
+        migrateFragmentedSessions()
     }
 
     // MARK: - Entry point: called by BLEManager at +5 s after stream starts
@@ -619,8 +620,11 @@ final class SyncManager: ObservableObject {
                 print("[Sync Summary] ──────────────────────────────────────")
             }
 
-            let newSessions = SleepDetector().process(sorted)
-            let uniqueNew = newSessions.filter { n in
+            let rawSessions = SleepDetector().process(sorted)
+            // Consolidate across nights (6 AM cutoff) — prevents same night yielding
+            // multiple sessions when SleepDetector mergeGap is not wide enough.
+            let nightConsolidated = consolidateByNight(rawSessions)
+            let uniqueNew = nightConsolidated.filter { n in
                 guard n.end.timeIntervalSince(n.start) >= 1800 else { return false }
                 return !sleepSessions.contains { abs($0.start.timeIntervalSince(n.start)) < 3600 }
             }
@@ -639,17 +643,95 @@ final class SyncManager: ObservableObject {
             print("[Sync Summary] ──────────────────────────────────────")
         }
 
-        // Flush pendingBatchHR to RawDataStore atomically before enqueue — prevents race where
-        // recomputeDay starts before appendHRBatch completes if they were separate Tasks.
+        // Flush pendingBatchHR + RR from accumulated samples atomically before enqueue.
         if let ble = bleManager {
             let dates = dateKeys.compactMap { parseISODateString($0) }
             let batchHR = pendingBatchHR
             pendingBatchHR = []
+            let batchRR: [(timestamp: Int, intervalMs: Int)] = accumulatedSamples.flatMap { s in
+                (s.rrIntervals ?? []).map { rr in
+                    (timestamp: Int(s.timestamp.timeIntervalSince1970),
+                     intervalMs: Int(rr * 1000))
+                }
+            }
             Task {
                 if !batchHR.isEmpty { await ble.rawDataStore.appendHRBatch(batchHR) }
-                await ble.recomputeQueue.enqueue(dates: dates, rawStore: ble.rawDataStore, dailyStore: ble.dailyMetrics)
+                if !batchRR.isEmpty { await ble.rawDataStore.appendRRBatch(batchRR) }
+                await ble.recomputeQueue.enqueue(dates: dates, rawStore: ble.rawDataStore, dailyStore: ble.dailyMetrics) { [weak ble] in
+                    guard let ble else { return }
+                    await ble.refreshRecoveryFromStore()
+                }
             }
-            print("[Recompute] sync done — queued \(dates.count) date(s), batch HR samples=\(batchHR.count)")
+            print("[Recompute] sync done — queued \(dates.count) date(s), HR=\(batchHR.count) RR=\(batchRR.count)")
+        }
+    }
+
+    // MARK: - Night-level session consolidation
+
+    // Returns the calendar date key for the "night" a session belongs to.
+    // Sessions starting before 6 AM belong to the previous day's night.
+    private func nightKey(for date: Date) -> String {
+        let cal = Calendar.current
+        let hour = cal.component(.hour, from: date)
+        let anchor = hour < 6 ? cal.date(byAdding: .day, value: -1, to: date)! : date
+        let c = cal.dateComponents([.year, .month, .day], from: anchor)
+        return String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
+    }
+
+    // Within a single night's sessions (already sorted by start), merge consecutive
+    // pairs where the gap is ≤ 30 minutes. The gap counts as a brief wake.
+    private func mergeNightSessions(_ sessions: [SleepSession]) -> [SleepSession] {
+        guard sessions.count > 1 else { return sessions }
+        let sorted = sessions.sorted { $0.start < $1.start }
+        var result: [SleepSession] = []
+        var current = sorted[0]
+        for next in sorted.dropFirst() {
+            let gap = next.start.timeIntervalSince(current.end)
+            if gap <= 1800 {
+                let mergedStages: [SleepStageSegment]?
+                switch (current.stages, next.stages) {
+                case (let a?, let b?): mergedStages = a + b
+                case (let a?, nil):    mergedStages = a
+                case (nil, let b?):    mergedStages = b
+                default:               mergedStages = nil
+                }
+                current = SleepSession(
+                    start: min(current.start, next.start),
+                    end: max(current.end, next.end),
+                    stages: mergedStages,
+                    briefWakeCount: current.briefWakeCount + next.briefWakeCount + 1,
+                    briefWakeTotalSeconds: current.briefWakeTotalSeconds + next.briefWakeTotalSeconds + Int(gap)
+                )
+            } else {
+                result.append(current)
+                current = next
+            }
+        }
+        result.append(current)
+        return result
+    }
+
+    // Group sessions by night key, merge each night, return consolidated flat list.
+    private func consolidateByNight(_ sessions: [SleepSession]) -> [SleepSession] {
+        guard sessions.count > 1 else { return sessions }
+        var grouped: [String: [SleepSession]] = [:]
+        for s in sessions { grouped[nightKey(for: s.start), default: []].append(s) }
+        return grouped.sorted { $0.key < $1.key }.flatMap { mergeNightSessions($0.value) }
+    }
+
+    // One-time migration: consolidate fragmented sessions from before this version.
+    private func migrateFragmentedSessions() {
+        let migrationKey = "sleepMigrationV2Done"
+        guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
+        UserDefaults.standard.set(true, forKey: migrationKey)
+        guard sleepSessions.count > 1 else { return }
+
+        let consolidated = consolidateByNight(sleepSessions).sorted { $0.start < $1.start }
+        if consolidated.count < sleepSessions.count {
+            let orig = sleepSessions.count
+            sleepSessions = consolidated
+            saveSleepSessions()
+            print("[Migration] consolidated \(orig) sleep fragments into \(consolidated.count) sessions")
         }
     }
 
