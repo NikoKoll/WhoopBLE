@@ -4,9 +4,9 @@ import HealthKit
 /// Bump these to trigger automatic backfill of all existing daily_metrics rows on next launch.
 enum AlgoVersions {
     static let hrv      = 3   // stage 2 deviation filter (§9.5): rejects RR >20% from rolling mean
-    static let strain   = 1   // exponential zone weights (§9.9)
-    static let sleep    = 5   // + personalized sleep need (SleepNeedCalculator)
-    static let recovery = 8   // z-score clamped ±3σ (§9.8); nil sleep = 0 min
+    static let strain   = 2   // user-age driven maxHR (220 − age) instead of hardcoded 185
+    static let sleep    = 6   // SleepDetector tail-onset fix + UTC nap-credit anchor
+    static let recovery = 9   // nil sleep = neutral (z=0), no longer 0-min penalty
 }
 
 /// Pure compute functions + recomputeDay orchestrator.
@@ -132,9 +132,8 @@ struct DayRecomputer {
     /// Exponential zone-weighted cardiovascular load, normalized to 0–21 scale.
     /// Uses actual timestamp gaps between samples so batch (1s) and live (30s) data
     /// both produce correct time-in-zone without overcounting.
-    func computeStrain(hrSamples: [RawDataStore.HRSample]) -> Double {
+    func computeStrain(hrSamples: [RawDataStore.HRSample], maxHR: Int) -> Double {
         guard hrSamples.count >= 2 else { return 0 }
-        let maxHR      = 185  // 220 – 35 (default age 35; no user profile yet)
         let boundaries = [0.50, 0.60, 0.70, 0.80, 0.90].map { Int(Double(maxHR) * $0) }
         let weights    = [0.50, 1.01, 2.03, 4.08, 8.20]  // exp zone weights from §9.9
         // Realistic max: 60 min Zone5 + 720 min Zone1 — weight × hours.
@@ -187,7 +186,11 @@ struct DayRecomputer {
         let rr = await rawStore.loadRR(for: date)
 
         let rhr    = computeRHR(hrSamples: hr)
-        let strain = computeStrain(hrSamples: hr)
+        // User age drives maxHR (220 − age). Default 35 if not yet set in Settings.
+        let storedAge = UserDefaults.standard.integer(forKey: "userAge")
+        let userAge   = storedAge > 0 ? max(10, min(100, storedAge)) : 35
+        let maxHR     = 220 - userAge
+        let strain  = computeStrain(hrSamples: hr, maxHR: maxHR)
 
         // Detect overnight sleep on a tight nightly window [prev 18:00, today 12:00]. Feeding
         // the full 48h to SleepDetector caused its 60-min wake-gap absorption to merge daytime

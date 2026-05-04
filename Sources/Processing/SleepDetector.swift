@@ -42,7 +42,7 @@ final class SleepDetector {
         // Rolling baseline per window (trailing 60 min p10 of HR samples)
         let baselines = windows.indices.map { i -> Double in
             let cutoff = windows[i].end.addingTimeInterval(-baselineWindow)
-            let pool = sorted.filter { $0.timestamp >= cutoff && $0.timestamp <= windows[i].end }
+            let pool = sorted.filter { $0.timestamp >= cutoff && $0.timestamp < windows[i].end }
                              .map { Double($0.heartRate) }
                              .sorted()
             guard pool.count >= 12 else { return globalP10 }
@@ -132,10 +132,15 @@ final class SleepDetector {
 
             if isAsleep {
                 if startIdx == nil {
-                    // Onset: require N consecutive non-awake to start
-                    let lookahead = min(stages.count, i + onsetWindows)
-                    let confirmed = (i..<lookahead).allSatisfy { stages[$0] != .awake }
-                    if confirmed { startIdx = i }
+                    // Onset: require N consecutive non-awake to start. If fewer than
+                    // onsetWindows windows remain, defer to trailing close-out (lines below
+                    // handle open startIdx at end of stream) instead of confirming on a
+                    // truncated lookahead — avoids vacuous allSatisfy on empty range.
+                    let end = i + onsetWindows
+                    if end <= stages.count {
+                        let confirmed = (i..<end).allSatisfy { stages[$0] != .awake }
+                        if confirmed { startIdx = i }
+                    }
                 }
                 if startIdx != nil {
                     lastAsleepIdx = i

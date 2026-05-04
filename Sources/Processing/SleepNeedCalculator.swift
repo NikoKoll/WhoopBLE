@@ -62,13 +62,16 @@ struct SleepNeedCalculator {
         let debt = min(120, max(0, debtRaw))
 
         // --- Nap credit: daytime sessions (start 10:00–21:00 local) whose end date matches date ---
+        // `date` is UTC-keyed (matches dailyMetrics rows), so anchor day comparison in UTC
+        // to avoid off-by-one near midnight when user's local TZ is east/west of UTC.
+        // Start-hour check stays in local TZ — "daytime nap" is a user-perception window.
         let localCal = Calendar.current
-        let targetDay = localCal.startOfDay(for: date)
+        let targetDayUTC = utcCal.startOfDay(for: date)
         var napMinutes = 0
         for session in sleepSessions {
             let startHour = localCal.component(.hour, from: session.start)
             guard startHour >= 10, startHour < 21 else { continue }
-            guard localCal.startOfDay(for: session.end) == targetDay else { continue }
+            guard utcCal.startOfDay(for: session.end) == targetDayUTC else { continue }
             napMinutes += Int(session.end.timeIntervalSince(session.start) / 60)
         }
         let napCredit = min(60, napMinutes)

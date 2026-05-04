@@ -17,6 +17,7 @@ struct SettingsView: View {
     @Environment(\.openURL) private var openURL
     @State private var showClearConfirm = false
     @AppStorage("userWeightKg") private var userWeightKg: Double = 78
+    @AppStorage("userAge")      private var userAge: Int        = 35
 
     var body: some View {
         Form {
@@ -64,6 +65,16 @@ struct SettingsView: View {
                         .multilineTextAlignment(.trailing)
                         .frame(width: 80)
                     Text("kg").foregroundStyle(.secondary)
+                }
+                Stepper(value: $userAge, in: 10...100) {
+                    HStack {
+                        Text("Age")
+                        Spacer()
+                        Text("\(userAge)").foregroundStyle(.secondary)
+                    }
+                }
+                LabeledContent("Max HR") {
+                    Text("\(220 - userAge) bpm").foregroundStyle(.secondary)
                 }
             }
 

@@ -5,9 +5,14 @@ import HealthKit
 
 // Active MET above resting (BMR excluded). Continuous curve so sedentary HR still credits Move ring.
 // metTotal = 1.0 + max(0, (pct - 0.30) * 14), capped at 11. metActive = metTotal - 1.0.
-// At HR 70 (pct ~0.36) → metActive ~0.84; at HR 110 (pct ~0.56) → ~3.6; at HR 170 (pct ~0.87) → ~8.0.
-func metForHR(_ bpm: Int, maxHR: Double = 196) -> Double {
-    let pct = Double(bpm) / maxHR
+// maxHR defaults to 220 − age (age 35 if not set in Settings).
+func metForHR(_ bpm: Int, maxHR: Double? = nil) -> Double {
+    let resolvedMax = maxHR ?? {
+        let stored = UserDefaults.standard.integer(forKey: "userAge")
+        let age = stored > 0 ? max(10, min(100, stored)) : 35
+        return Double(220 - age)
+    }()
+    let pct = Double(bpm) / resolvedMax
     let metTotal = min(11.0, 1.0 + max(0, (pct - 0.30) * 14.0))
     return max(0, metTotal - 1.0)
 }
@@ -68,7 +73,12 @@ final class BLEManager: NSObject, ObservableObject {
     private var pendingEnergyKcal: Double = 0
     private var activityWindowStart: Date = .distantPast
     private var lastActivityFlush: Date = .distantPast
+    // Tracks the most recent HR-sample timestamp so per-sample MET cost integrates the real
+    // sample interval (live throttle ~30 s, batch 1 s) instead of assuming 1 Hz.
+    private var lastEnergySampleAt: Date? = nil
     private let activityFlushInterval: TimeInterval = 180  // 3 minutes
+    // Cap a single sample's contribution at 60 s — anything larger means strap-off / paused stream.
+    private let maxEnergySampleGapSec: TimeInterval = 60
     private var stepsAtWindowStart: Int = 0
     private let minWalkingKcalPerMin: Double = 4.5
     // Seconds within the current activity window where metActive ≥ 3 (brisk-walk equivalent).
@@ -84,6 +94,11 @@ final class BLEManager: NSObject, ObservableObject {
     let rawDataStore   = RawDataStore()
     let dailyMetrics   = DailyMetricsStore()
     let recomputeQueue = RecomputeQueue()
+
+    // Wrist-wear state from GET_HELLO_HARVARD (0x35) ACK. nil until first strap response.
+    @Published var isWristOn: Bool? = nil
+    // WHOOP-style HRV score: ln(RMSSD_ms) / 6.5 × 100 (0–100 scale). Updated with smoothedHRV.
+    @Published var whoopHRVScore: Double? = nil
 
     // Most recent recovery score (0–100) from DailyMetricsStore. Sleep that ends this morning
     // is bucketed into today's UTC row (post-midnight HR samples), so the freshest score is
@@ -127,6 +142,12 @@ final class BLEManager: NSObject, ObservableObject {
     override init() {
         super.init()
         syncManager.bleManager = self
+        syncManager.onWristState = { [weak self] worn in
+            Task { @MainActor [weak self] in
+                self?.isWristOn = worn
+                self?.liveSleep.wristOn = worn
+            }
+        }
         liveSleep.onSessionEnd = { [weak self] session in
             Task { @MainActor [weak self] in self?.syncManager.addSleepSession(session) }
         }
@@ -310,13 +331,20 @@ final class BLEManager: NSObject, ObservableObject {
             activityWindowStart = metrics.timestamp
             lastActivityFlush   = metrics.timestamp
             stepsAtWindowStart  = dailySteps
+            lastEnergySampleAt  = metrics.timestamp
         }
 
-        let durationHours = 1.0 / 3600.0  // assume ~1 sample/sec
+        // Real interval since previous sample (capped). First sample after init contributes
+        // 0 because lastEnergySampleAt was just set. Live-stream throttle of 30 s now
+        // correctly attributes 30 s/sample instead of 1 s — fixes prior ~30× undercount.
+        let prev = lastEnergySampleAt ?? metrics.timestamp
+        let gapSec = max(0, min(maxEnergySampleGapSec, metrics.timestamp.timeIntervalSince(prev)))
+        lastEnergySampleAt = metrics.timestamp
+        let durationHours = gapSec / 3600.0
         let met = metForHR(metrics.heartRate)
         let kcalDelta = met * userWeightKg * durationHours
         pendingEnergyKcal += kcalDelta
-        if met >= exerciseMETThreshold { pendingExerciseSec += 1.0 }
+        if met >= exerciseMETThreshold { pendingExerciseSec += gapSec }
 
         // Feed session aggregator. Aggregator owns the workout emit; this method only owns Move-ring standalone writes.
         workoutAggregator.observe(timestamp: metrics.timestamp, hr: metrics.heartRate, met: met, kcalDelta: kcalDelta)
@@ -396,6 +424,8 @@ final class BLEManager: NSObject, ObservableObject {
                 self.hrvHistory.append(rmssd)
                 if self.hrvHistory.count > 5 { self.hrvHistory.removeFirst() }
                 self.smoothedHRV = self.hrvHistory.reduce(0, +) / Double(self.hrvHistory.count)
+                // WHOOP-style normalized score: ln(RMSSD_ms) / 6.5 × 100
+                self.whoopHRVScore = min(100, max(0, log(rmssd) / 6.5 * 100))
             }
             self.metricsStore.record(timestamp: metrics.timestamp,
                                      heartRate: metrics.heartRate,
@@ -528,6 +558,7 @@ extension BLEManager: CBCentralManagerDelegate {
             pendingEnergyKcal = 0
             activityWindowStart = .distantPast
             lastActivityFlush = .distantPast
+            lastEnergySampleAt = nil
             stepsAtWindowStart = 0
             startScanning()
         }
@@ -633,7 +664,9 @@ extension BLEManager: CBPeripheralDelegate {
         peripheral.writeValue(WhoopCRC.enableHealth, for: char, type: .withoutResponse)
         // Request HR broadcast on standard BLE HR service (0x180D / 0x2A37).
         peripheral.writeValue(WhoopCRC.enableHRBroadcast, for: char, type: .withoutResponse)
-        print("📤 enableHealth + enableHRBroadcast sent")
+        // Query wrist/charging status — ACK parsed in SyncManager (cmd_echo=0x35).
+        peripheral.writeValue(WhoopCRC.getHelloHarvard, for: char, type: .withoutResponse)
+        print("📤 enableHealth + enableHRBroadcast + getHelloHarvard sent")
 
         // Send (0x03, 0x02) at 5s. In every working session this was present alongside
         // enableHealth; removing it caused total silence from the strap.
@@ -642,7 +675,8 @@ extension BLEManager: CBPeripheralDelegate {
             do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
             guard let self, let p = self.peripheral, let c = self.cmdToStrap else { return }
             self.bleQueue.async { p.writeValue(WhoopCRC.buildCommand(category: 0x03, value: 0x02), for: c, type: .withoutResponse) }
-            print("▶️ (0x03,0x02) sent")
+            self.bleQueue.async { p.writeValue(WhoopCRC.toggleIMUHistorical, for: c, type: .withoutResponse) }
+            print("▶️ (0x03,0x02) + IMU historical enable sent")
             await MainActor.run { self.syncManager.onConnected() }
         }
 
@@ -754,7 +788,29 @@ extension BLEManager: CBPeripheralDelegate {
             lastDecodedHR = hr
             acceptMetrics(metrics)
         } else {
-            print("⚠️ rejected (count=\(data.count) byte3=\(data.count > 3 ? String(format: "%02x", data[3]) : "?"))")
+            // HR (byte[10]) is out of range on most 0x57 packets (~228), but RR intervals
+            // at bytes[11+] are independent and can still feed RMSSD.
+            // Extract RR from any 0x57/0xab/0x52 packet that was rejected for bad HR.
+            let bytes = [UInt8](data)
+            guard bytes.count >= 12,
+                  bytes[0] == 0xaa,
+                  (bytes[3] == 0x57 || bytes[3] == 0xab || bytes[3] == 0x52),
+                  lastDecodedHR > 0 else {
+                print("⚠️ rejected (count=\(data.count) byte3=\(data.count > 3 ? String(format: "%02x", data[3]) : "?"))")
+                return
+            }
+            let rrCount = min(Int(bytes[11]), 4)
+            var rrs: [Double] = []
+            for i in 0..<rrCount {
+                let base = 12 + i * 2
+                guard base + 1 < bytes.count else { break }
+                let raw = UInt16(bytes[base]) | UInt16(bytes[base + 1]) << 8
+                if raw >= 300, raw <= 2000 { rrs.append(Double(raw) / 1000.0) }
+            }
+            guard !rrs.isEmpty else { return }
+            // Use last known HR so the RR data lands in acceptMetrics with a valid heartRate.
+            acceptMetrics(WhoopMetrics(timestamp: Date(), heartRate: lastDecodedHR, rrIntervals: rrs))
+            print("💓 RR-only from 0x\(String(format: "%02x", bytes[3])): \(rrs.map { Int($0 * 1000) })")
         }
     }
 }

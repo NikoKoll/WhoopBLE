@@ -473,12 +473,28 @@ struct DashboardView: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.45))
                     .kerning(1.5)
-                Text(hrvText)
-                    .font(.system(size: 32, weight: .semibold, design: .rounded))
-                    .foregroundStyle(isStale ? Color.cyan.opacity(0.35) : .cyan)
-                    .contentTransition(.numericText())
-                    .animation(.smoothFallback(), value: ble.smoothedHRV)
-                    .animation(.smoothFallback(duration: 0.5), value: isStale)
+                HStack(alignment: .bottom, spacing: 10) {
+                    Text(hrvText)
+                        .font(.system(size: 32, weight: .semibold, design: .rounded))
+                        .foregroundStyle(isStale ? Color.cyan.opacity(0.35) : .cyan)
+                        .contentTransition(.numericText())
+                        .animation(.smoothFallback(), value: ble.smoothedHRV)
+                        .animation(.smoothFallback(duration: 0.5), value: isStale)
+                    if let score = ble.whoopHRVScore {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("\(Int(score))")
+                                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                                .foregroundStyle(isStale ? Color.cyan.opacity(0.25) : .cyan.opacity(0.7))
+                                .contentTransition(.numericText())
+                                .animation(.smoothFallback(), value: ble.whoopHRVScore)
+                            Text("SCORE")
+                                .font(.system(size: 7, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.35))
+                                .kerning(1.2)
+                        }
+                        .padding(.bottom, 2)
+                    }
+                }
             }
             Spacer(minLength: 0)
             if let rr = metrics?.rrIntervals, !rr.isEmpty {

@@ -29,6 +29,9 @@ final class LiveSleepMonitor {
     private var isStationary = true
     private let motionManager = CMMotionActivityManager()
 
+    // Wrist-wear state from GET_HELLO_HARVARD ACK. nil = unknown (don't gate sleep).
+    var wristOn: Bool? = nil
+
     // Called on main actor when a sleep session is confirmed.
     var onSessionEnd: ((SleepSession) -> Void)?
 
@@ -50,6 +53,8 @@ final class LiveSleepMonitor {
         let min = hrBuffer.min()!
 
         // Sleep signal: HR within 5 BPM of rolling minimum AND device stationary.
+        // wristOn from 0x35 ACK observed but NOT used to gate — bit-layout unverified
+        // and prior gating blocked overnight detection when bit read false.
         let sleepLike = avg < (min + 5) && isStationary
 
         // Soft time prior (§9.7): 10 min inside 21:00–11:00, 20 min outside.

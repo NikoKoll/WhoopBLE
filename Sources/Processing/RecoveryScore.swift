@@ -23,9 +23,7 @@ struct RecoveryScore {
         sleepBaseline: (mean: Double, std: Double)?,
         strainBaseline:(mean: Double, std: Double)?
     ) -> Double? {
-        // sleepMinutes nil = no sleep detected = 0 min (penalizes recovery, not unknown)
         guard let hrv, let rhr, let strain else { return nil }
-        let sleep = Double(sleepMinutes ?? 0)
 
         let hb  = hrvBaseline    ?? popHRV
         let rb  = rhrBaseline    ?? popRHR
@@ -37,10 +35,15 @@ struct RecoveryScore {
             return max(-3.0, min(3.0, (v - b.mean) / b.std))  // §9.8 clamp
         }
 
+        // sleepMinutes nil = no sleep detected = neutral (z=0). Distinct from "0 minutes
+        // actually slept" which is detected (sleep=0 → z ≈ −3 after clamp). Prevents
+        // recovery from being unfairly tanked when overnight sync hasn't run yet.
+        let sleepZ: Double = sleepMinutes.map { z(Double($0), sb) } ?? 0
+
         // Composite z-score (signed: positive = recovered).
         let composite = 0.4  *  z(hrv,    hb)
                       - 0.25 *  z(rhr,    rb)
-                      + 0.25 *  z(sleep,  sb)
+                      + 0.25 *  sleepZ
                       - 0.1  *  z(strain, stb)
 
         // tanh maps composite → (-1, 1) smoothly; ×40 spreads range ~10–90 for real-world values.

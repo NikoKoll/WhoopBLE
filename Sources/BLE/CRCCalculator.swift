@@ -51,6 +51,12 @@ enum WhoopCRC {
     static let keepaliveHealth   = buildCommand(category: 0x03, value: 0x02)
     static let disableHealth     = buildCommand(category: 0x03, value: 0x00)
     static let enableHRBroadcast = buildCommand(category: 0x0E, value: 0x01)
+    // GET_HELLO_HARVARD (category 0x35): queries device status; ACK byte[9] = status bitmask
+    // (bit 0 suspected = wrist worn, bit 1 = charging — log raw byte to confirm on first use).
+    static let getHelloHarvard   = buildCommand(category: 0x35, value: 0x00)
+    // TOGGLE_IMU_MODE_HISTORICAL (category 0x69): may enable accelerometer data in 0xa1 chunks.
+    // Zero-risk; strap silently ignores unrecognised commands.
+    static let toggleIMUHistorical = buildCommand(category: 0x69, value: 0x01)
     // Triggers historical batch enumeration on DATA_FROM_STRAP (category=0x16).
     // 8-byte format confirmed working on device; repo suggests 16-byte but unverified.
     static let syncTrigger = buildCommand(category: 0x16, value: 0x00)

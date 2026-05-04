@@ -13,6 +13,11 @@ final class SyncManager: ObservableObject {
     @Published var sleepSessions: [SleepSession] = []
     // Controls banner visibility: true while syncing + 8 s after completion
     @Published var syncBannerVisible = false
+    // Wrist-wear state from GET_HELLO_HARVARD (0x35) ACK. nil until first response.
+    @Published var wristOn: Bool? = nil
+
+    // Called when wrist-wear state updates — wired by BLEManager.
+    var onWristState: ((Bool) -> Void)?
 
     // MARK: - Internal state
     weak var bleManager: BLEManager?
@@ -146,6 +151,16 @@ final class SyncManager: ObservableObject {
         let status    = bytes[8]
         let dataByte  = bytes[9]
         print("[SyncManager] 0xfc ACK: cmd=0x\(String(format: "%02x", cmdEcho)) status=\(status) data=\(dataByte)")
+
+        // GET_HELLO_HARVARD ACK — bit 0 suspected = wrist worn, bit 1 = charging.
+        // Log raw byte; interpretation validated after first device test.
+        if cmdEcho == 0x35 {
+            let worn = (dataByte & 0x01) != 0
+            print("[SyncManager] wrist status byte=0x\(String(format: "%02x", dataByte)) worn=\(worn) charging=\((dataByte & 0x02) != 0)")
+            wristOn = worn
+            onWristState?(worn)
+            return
+        }
 
         // Sync trigger ACK — strap reports how many batches are queued.
         guard cmdEcho == 0x16 else { return }
@@ -432,6 +447,11 @@ final class SyncManager: ObservableObject {
                     let secs = Double(ms) / 1000.0
                     if secs >= 0.3 && secs <= 2.0 { rrs.append(secs) }
                 }
+            }
+            // Log unknown bytes[27-46] to detect IMU data after TOGGLE_IMU_MODE_HISTORICAL.
+            if SyncManager.debugLogging && bytes.count > 46 {
+                let imuHex = Array(bytes[27...46]).map { String(format: "%02x", $0) }.joined(separator: " ")
+                print("[SyncManager] 0xa1 imu-region[27-46]: \(imuHex)")
             }
             let offsetSecs = Double(chunkSeq - maxChunkSeq)  // ≤ 0, so timestamp ≤ batchTs
             let timestamp = batchTs.addingTimeInterval(offsetSecs)
