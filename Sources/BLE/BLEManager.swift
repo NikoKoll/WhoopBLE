@@ -104,6 +104,9 @@ final class BLEManager: NSObject, ObservableObject {
     // is bucketed into today's UTC row (post-midnight HR samples), so the freshest score is
     // typically today's; falls back to the latest prior day with a non-nil value.
     @Published var recoveryScore: Double? = nil
+    // ISO date (YYYY-MM-DD UTC) of the row backing `recoveryScore`. nil when no score yet.
+    // Dashboard uses this to flag "as of <date>" when score is older than today.
+    @Published var recoveryDateKey: String? = nil
     // Daily strain (0–21), sleep duration (minutes), and sleep need (minutes) from DailyMetricsStore.
     @Published var todayStrain: Double? = nil
     @Published var todaySleepMinutes: Int? = nil
@@ -257,7 +260,9 @@ final class BLEManager: NSObject, ObservableObject {
         let sorted = all.sorted { $0.date > $1.date }
 
         // Recovery: fall back across days (morning lock-in may lag by a day).
-        let score = sorted.first(where: { $0.recoveryScore != nil })?.recoveryScore
+        let scoreRow = sorted.first(where: { $0.recoveryScore != nil })
+        let score    = scoreRow?.recoveryScore
+        let scoreKey = scoreRow?.date
 
         // Strain + sleep: only current or previous calendar day — stale days are misleading.
         var utcCal = Calendar(identifier: .gregorian)
@@ -277,6 +282,7 @@ final class BLEManager: NSObject, ObservableObject {
 
         await MainActor.run {
             self.recoveryScore         = score
+            self.recoveryDateKey       = scoreKey
             self.todayStrain           = strain
             self.todaySleepMinutes     = sleepMin
             self.todaySleepNeedMinutes = sleepNeed
@@ -380,11 +386,13 @@ final class BLEManager: NSObject, ObservableObject {
             print("[HK] Energy skipped: session active (\(String(format: "%.1f", kcal)) kcal absorbed by workout)")
             return
         }
-        // Suppress live write if Apple Watch wrote activeEnergyBurned in the last 5 min — Watch dominates Move ring.
+        // Only suppress when Watch already wrote energy covering THIS write window — true
+        // double-count case. Prior 5-min "recently active" check always fired when Watch was
+        // paired (Watch logs energy every minute idle), permanently stalling the Move ring.
         Task { [healthKit, kcal, windowStart, windowEnd] in
-            let watchActive = await healthKit.watchEnergyActiveRecently()
-            if watchActive {
-                print("[HK] Energy suppressed: watch active (\(String(format: "%.1f", kcal)) kcal skipped)")
+            let watchCovers = await healthKit.watchEnergyOverlapping(start: windowStart, end: windowEnd)
+            if watchCovers {
+                print("[HK] Energy suppressed: watch already covered window (\(String(format: "%.1f", kcal)) kcal skipped)")
                 return
             }
             await MainActor.run {

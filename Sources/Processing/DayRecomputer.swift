@@ -4,9 +4,9 @@ import HealthKit
 /// Bump these to trigger automatic backfill of all existing daily_metrics rows on next launch.
 enum AlgoVersions {
     static let hrv      = 3   // stage 2 deviation filter (§9.5): rejects RR >20% from rolling mean
-    static let strain   = 2   // user-age driven maxHR (220 − age) instead of hardcoded 185
-    static let sleep    = 6   // SleepDetector tail-onset fix + UTC nap-credit anchor
-    static let recovery = 9   // nil sleep = neutral (z=0), no longer 0-min penalty
+    static let strain   = 3   // recalibrated zone weights — Z1 dropped to 0.1, maxStrain → 11
+    static let sleep    = 7   // REM threshold 20→15 BPM (P1 stage tuning)
+    static let recovery = 10  // recomputes downstream of new strain + sleep
 }
 
 /// Pure compute functions + recomputeDay orchestrator.
@@ -135,9 +135,15 @@ struct DayRecomputer {
     func computeStrain(hrSamples: [RawDataStore.HRSample], maxHR: Int) -> Double {
         guard hrSamples.count >= 2 else { return 0 }
         let boundaries = [0.50, 0.60, 0.70, 0.80, 0.90].map { Int(Double(maxHR) * $0) }
-        let weights    = [0.50, 1.01, 2.03, 4.08, 8.20]  // exp zone weights from §9.9
-        // Realistic max: 60 min Zone5 + 720 min Zone1 — weight × hours.
-        let maxStrain  = 1.0 * weights[4] + 12.0 * weights[0]  // 8.20 + 6.00 = 14.20
+        // Recalibrated zone weights (P1): prior [0.50, 1.01, 2.03, 4.08, 8.20] gave Z1 (sedentary
+        // awake HR) the same order of magnitude as Z2, so 16 h of awake-but-resting saturated
+        // strain at ~21 with no actual workout. New weights drop Z1 to 0.1 so sedentary time
+        // contributes minimally; Z3+ remain steep so real exertion still drives strain up.
+        let weights    = [0.10, 0.50, 1.50, 4.00, 8.00]
+        // Realistic athlete day: 12 h Z1 + 4 h Z2 + 1 h Z3 + 30 min Z4 + 30 min Z5
+        //   = 1.2 + 2.0 + 1.5 + 2.0 + 4.0 = 10.7  → strain 21.
+        // Resting day (16 h Z1) = 1.6 → strain ~3. Reasonable spread.
+        let maxStrain: Double = 11.0
         // Gaps > 2 min capped — beyond that the user is not active (strap off, paused, etc).
         let maxGapSec  = 120.0
 

@@ -262,10 +262,32 @@ final class HealthKitWriter {
         }
     }
 
-    // Returns true if any HealthKit source containing "Watch" wrote an activeEnergyBurned sample in
-    // the last `lookback` seconds. Used to suppress live writes when Apple Watch is on the wrist
-    // (avoids double-counting against Move ring).
-    func watchEnergyActiveRecently(lookback: TimeInterval = 300) async -> Bool {
+    // True only if Apple Watch wrote activeEnergyBurned within the EXACT [start, end] window
+    // we are about to fill. Avoids the prior bug where any Watch sample in the last 5 minutes
+    // suppressed every write — that path stalled the Move ring whenever the Watch was paired,
+    // because Watch's idle 1–5 min writes always hit that lookback even when our window was empty.
+    // Now: only suppress when Watch already covers the same time range (true double-count case).
+    func watchEnergyOverlapping(start: Date, end: Date) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let type = HKQuantityType(.activeEnergyBurned)
+            let pred = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
+            let query = HKSampleQuery(sampleType: type, predicate: pred, limit: 50,
+                                      sortDescriptors: nil) { _, samples, _ in
+                let watchActive = samples?.contains { sample in
+                    let name = sample.sourceRevision.source.name.lowercased()
+                    let bundle = sample.sourceRevision.source.bundleIdentifier.lowercased()
+                    return name.contains("watch") || bundle.contains("com.apple.health.")
+                } ?? false
+                cont.resume(returning: watchActive)
+            }
+            store.execute(query)
+        }
+    }
+
+    // Backward-compat shim — used by `appleWatchPaired`-style "is Watch on the wrist now" checks.
+    // Tightened from 300s to 90s: 5-min lookback caused permanent suppression even when Watch
+    // was paired but NOT currently logging. 90s is the typical Watch idle write cadence.
+    func watchEnergyActiveRecently(lookback: TimeInterval = 90) async -> Bool {
         await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let type = HKQuantityType(.activeEnergyBurned)
             let end = Date()

@@ -105,9 +105,9 @@ final class WorkoutSessionAggregator {
         let hrSamples = buf.map { (ts: $0.ts, bpm: $0.hr) }
 
         Task { [healthKit] in
-            let watchActive = await healthKit.watchEnergyActiveRecently()
-            if watchActive {
-                print("[Session] suppressed: watch active")
+            let watchCovers = await healthKit.watchEnergyOverlapping(start: start, end: end)
+            if watchCovers {
+                print("[Session] suppressed: watch already covered \(start) → \(end)")
                 return
             }
             await MainActor.run {

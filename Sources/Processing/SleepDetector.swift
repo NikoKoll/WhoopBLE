@@ -19,10 +19,13 @@ final class SleepDetector {
     private let mergeGap: TimeInterval    = 90 * 60     // merge sessions within 90 min
     private let baselineWindow: TimeInterval = 60 * 60  // trailing 60 min for local baseline
 
-    // Stage thresholds vs localBaseline (BPM above baseline)
+    // Stage thresholds vs localBaseline (BPM above baseline).
+    // remHRMargin lowered 20→15: 20 BPM REM gate over-classified mid-night HR rises as AWAKE,
+    // fragmenting sessions. WHOOP/research literature places REM HR rises at 7–15 BPM above
+    // sleeping baseline; 15 keeps real awakening (≥15 BPM rise) flagged correctly.
     private let deepHRMargin: Double  = 3
     private let coreHRMargin: Double  = 8
-    private let remHRMargin: Double   = 20
+    private let remHRMargin: Double   = 15
     private let deepStdMax: Double    = 3
 
     func process(_ samples: [HistoricalSample]) -> [SleepSession] {

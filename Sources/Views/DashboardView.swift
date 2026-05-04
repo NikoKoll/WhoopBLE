@@ -547,9 +547,9 @@ struct DashboardView: View {
                     .foregroundStyle(recoveryColor)
                     .contentTransition(.numericText())
                     .animation(.smoothFallback(), value: ble.recoveryScore)
-                Text("—")
+                Text(recoveryAgeLabel)
                     .font(.system(size: 9, weight: .medium, design: .rounded))
-                    .foregroundStyle(.clear)
+                    .foregroundStyle(recoveryAgeLabel.isEmpty ? .clear : .orange.opacity(0.85))
                 Text("RECOVERY")
                     .font(.system(size: 8, weight: .semibold))
                     .foregroundStyle(recoveryColor.opacity(0.8))
@@ -569,6 +569,23 @@ struct DashboardView: View {
         if score >= 67 { return .green }
         if score >= 34 { return .yellow }
         return .red
+    }
+
+    // Empty when score is from today (UTC); otherwise short tag like "Apr 30" so the user
+    // sees the score is stale (overnight sync hasn't yet refreshed today's row).
+    private var recoveryAgeLabel: String {
+        guard let key = ble.recoveryDateKey else { return "" }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let c = cal.dateComponents([.year, .month, .day], from: Date())
+        let todayKey = String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
+        guard key != todayKey else { return "" }
+        let parts = key.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return "" }
+        var dc = DateComponents(); dc.year = parts[0]; dc.month = parts[1]; dc.day = parts[2]
+        guard let d = cal.date(from: dc) else { return "" }
+        let fmt = DateFormatter(); fmt.dateFormat = "MMM d"
+        return "as of \(fmt.string(from: d))"
     }
 
     // MARK: - Footer
