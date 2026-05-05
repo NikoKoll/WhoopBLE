@@ -15,7 +15,9 @@ final class SleepDetector {
 
     private let windowSize: TimeInterval  = 5 * 60      // 5-minute windows
     private let onsetWindows: Int         = 2           // 10 min of non-awake to confirm onset
-    private let maxWakeAbsorbWindows: Int = 12          // 60 min in-bed wake absorbed into session
+    // 30 min in-bed wake absorbed (was 60 — absorbed quiet mornings into session, producing
+    // 13–17h sessions ending late morning).
+    private let maxWakeAbsorbWindows: Int = 6
     private let mergeGap: TimeInterval    = 90 * 60     // merge sessions within 90 min
     private let baselineWindow: TimeInterval = 60 * 60  // trailing 60 min for local baseline
 
@@ -32,9 +34,14 @@ final class SleepDetector {
         guard samples.count >= 4 else { return [] }
         let sorted = samples.sorted { $0.timestamp < $1.timestamp }
 
-        // Global p10 fallback for the first hour (before rolling window has data).
+        // Global p5 anchors the baseline floor to the user's true RHR for this night.
+        // Without it, a long quiet pre-bed sit at HR ~65 drags the local 60-min p10 down to
+        // ~63, making sitting qualify as "asleep" (avg < min+5). globalP5 ≈ true RHR (~52),
+        // so floored baseline forces real sleep gate to be HR ≤ globalP5 + 5.
         let allHR = sorted.map { Double($0.heartRate) }.sorted()
+        let globalP5  = allHR[max(0, Int(Double(allHR.count) * 0.05) - 1)]
         let globalP10 = allHR[max(0, Int(Double(allHR.count) * 0.10) - 1)]
+        print("[SleepDetector] globalP5=\(Int(globalP5)) globalP10=\(Int(globalP10)) min=\(Int(allHR.first ?? 0)) max=\(Int(allHR.last ?? 0)) n=\(allHR.count)")
 
         let windows = buildWindows(from: sorted)
         guard !windows.isEmpty else { return [] }
@@ -42,14 +49,20 @@ final class SleepDetector {
         // Per-window features
         let features = windows.map { feature(for: $0) }
 
-        // Rolling baseline per window (trailing 60 min p10 of HR samples)
+        // Rolling baseline per window (trailing 60 min p10), floored to globalP5 so quiet
+        // pre-bed sitting can't drag the gate down enough to falsely classify as sleep.
         let baselines = windows.indices.map { i -> Double in
             let cutoff = windows[i].end.addingTimeInterval(-baselineWindow)
             let pool = sorted.filter { $0.timestamp >= cutoff && $0.timestamp < windows[i].end }
                              .map { Double($0.heartRate) }
                              .sorted()
-            guard pool.count >= 12 else { return globalP10 }
-            return pool[max(0, Int(Double(pool.count) * 0.10) - 1)]
+            let localP10: Double
+            if pool.count >= 12 {
+                localP10 = pool[max(0, Int(Double(pool.count) * 0.10) - 1)]
+            } else {
+                localP10 = globalP10
+            }
+            return max(localP10, globalP5)
         }
 
         let stages = features.indices.map { i -> SleepStage in
@@ -153,8 +166,9 @@ final class SleepDetector {
                 consecutiveAwake += 1
                 if consecutiveAwake > maxWakeAbsorbWindows {
                     // Wake persisted long enough — close session at last sleep window
-                    if let s = startIdx, let e = lastAsleepIdx {
-                        sessions.append(buildSession(windows: windows, stages: stages, from: s, to: e))
+                    if let s = startIdx, let e = lastAsleepIdx,
+                       let session = buildSession(windows: windows, stages: stages, from: s, to: e) {
+                        sessions.append(session)
                     }
                     startIdx = nil
                     lastAsleepIdx = nil
@@ -163,14 +177,26 @@ final class SleepDetector {
             }
         }
 
-        if let s = startIdx, let e = lastAsleepIdx {
-            sessions.append(buildSession(windows: windows, stages: stages, from: s, to: e))
+        if let s = startIdx, let e = lastAsleepIdx,
+           let session = buildSession(windows: windows, stages: stages, from: s, to: e) {
+            sessions.append(session)
         }
         return sessions
     }
 
-    private func buildSession(windows: [Window], stages: [SleepStage], from s: Int, to e: Int) -> SleepSession {
-        let segments = (s...e).map {
+    private func buildSession(windows: [Window], stages: [SleepStage], from s: Int, to e: Int) -> SleepSession? {
+        // Trim session boundaries to first/last DEEP-stage window. REM rarely fires on
+        // historical 0xa1 data (sparse RR), so DEEP is the only reliable "definitely asleep"
+        // marker. Pre-bed sitting and post-wake couch time get classified as CORE because HR
+        // is just above sleep baseline — trimming kills those tails. If no DEEP exists in
+        // the window, the period probably wasn't real sleep at all → drop it.
+        let deepIndices = (s...e).filter { stages[$0] == .deep }
+        guard let trimS = deepIndices.first, let trimE = deepIndices.last else {
+            print("[SleepDetector] dropped raw session \(windows[s].start) → \(windows[e].end) — no DEEP segment")
+            return nil
+        }
+
+        let segments = (trimS...trimE).map {
             SleepStageSegment(start: windows[$0].start, end: windows[$0].end, stage: stages[$0])
         }
         // Coalesce adjacent same-stage segments
@@ -184,10 +210,10 @@ final class SleepDetector {
                 merged.append(seg)
             }
         }
-        // Awake windows within the sleep period count as brief wakes.
-        let awakeCount = (s...e).filter { stages[$0] == .awake }.count
+        // Awake windows within the trimmed sleep period count as brief wakes.
+        let awakeCount = (trimS...trimE).filter { stages[$0] == .awake }.count
         let briefWakeSecs = awakeCount * Int(windowSize)
-        return SleepSession(start: windows[s].start, end: windows[e].end, stages: merged,
+        return SleepSession(start: windows[trimS].start, end: windows[trimE].end, stages: merged,
                             briefWakeCount: awakeCount, briefWakeTotalSeconds: briefWakeSecs)
     }
 

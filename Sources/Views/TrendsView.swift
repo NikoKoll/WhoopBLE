@@ -1,6 +1,27 @@
 import SwiftUI
 import Charts
 
+// MARK: - Card container (mirrors DashboardView.DashCard / SleepView.SleepCard)
+
+private struct TrendsCard<Content: View>: View {
+    let content: Content
+    init(@ViewBuilder _ content: () -> Content) { self.content = content() }
+
+    var body: some View {
+        content
+            .padding(.vertical, 14)
+            .padding(.horizontal, 18)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5)
+                    )
+            )
+    }
+}
+
 struct TrendsView: View {
     @ObservedObject var store: MetricsStore
     /// Live CMPedometer step count — always today, never inflated by batch sync.
@@ -42,15 +63,14 @@ struct TrendsView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
-            ScrollView {
-                VStack(spacing: 20) {
+            backgroundLayer
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 16) {
                     Picker("Range", selection: $range) {
                         ForEach(TrendRange.allCases, id: \.self) { Text($0.rawValue) }
                     }
                     .pickerStyle(.segmented)
                     .environment(\.colorScheme, .dark)
-                    .padding(.horizontal)
 
                     if range == .today {
                         todayView
@@ -60,7 +80,9 @@ struct TrendsView: View {
                             .transition(.opacity.combined(with: .move(edge: .trailing)))
                     }
                 }
-                .padding(.vertical)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 32)
                 .animation(.easeInOut(duration: 0.22), value: range)
             }
         }
@@ -70,6 +92,22 @@ struct TrendsView: View {
             let newDay = cal.startOfDay(for: Date())
             if newDay != today { today = newDay }
         }
+    }
+
+    // MARK: - Background
+
+    private var backgroundLayer: some View {
+        ZStack {
+            Color.black
+            RadialGradient(
+                colors: [Color.cyan.opacity(0.22), .clear],
+                center: .init(x: 0.5, y: 0.18),
+                startRadius: 0,
+                endRadius: 380
+            )
+            .blendMode(.plusLighter)
+        }
+        .ignoresSafeArea()
     }
 
     // MARK: - Today
@@ -83,7 +121,7 @@ struct TrendsView: View {
         }
         return VStack(spacing: 16) {
             // Steps tile
-            card {
+            TrendsCard {
                 HStack(spacing: 14) {
                     Image(systemName: "figure.walk")
                         .font(.system(size: 28, weight: .semibold))
@@ -103,7 +141,7 @@ struct TrendsView: View {
             }
 
             // HR chart
-            card {
+            TrendsCard {
                 VStack(alignment: .leading, spacing: 10) {
                     label("HEART RATE — TODAY")
                     if entries.count >= 2 {
@@ -136,7 +174,7 @@ struct TrendsView: View {
             }
 
             // HRV chart
-            card {
+            TrendsCard {
                 VStack(alignment: .leading, spacing: 10) {
                     label("HRV RMSSD — TODAY")
                     if hrvEntries.count >= 2 {
@@ -179,7 +217,7 @@ struct TrendsView: View {
             // HR rows — one row per day; horizontal bar + label + value.
             // Replaces BarMark chart whose `.annotation(position:.bottom)` weekday
             // labels rendered inside plot and overlapped bars.
-            card {
+            TrendsCard {
                 VStack(alignment: .leading, spacing: 10) {
                     label("DAILY AVG HEART RATE")
                     if hrS.isEmpty {
@@ -198,7 +236,7 @@ struct TrendsView: View {
             }
 
             // HRV area + line chart
-            card {
+            TrendsCard {
                 VStack(alignment: .leading, spacing: 10) {
                     label("DAILY AVG HRV")
                     if hrvS.count >= 2 {
@@ -234,7 +272,7 @@ struct TrendsView: View {
             }
 
             // Steps bar chart
-            card {
+            TrendsCard {
                 VStack(alignment: .leading, spacing: 10) {
                     label("DAILY STEPS")
                     if !stepS.isEmpty {
@@ -282,7 +320,7 @@ struct TrendsView: View {
         let avgHRV   = hrvVals.isEmpty ? nil : hrvVals.reduce(0, +) / Double(hrvVals.count)
         let totalSteps = stepS.map(\.steps).reduce(0, +)
 
-        return card {
+        return TrendsCard {
             HStack(spacing: 0) {
                 statCell("AVG HR",
                          value: avgHR.map { String(format: "%.0f bpm", $0) } ?? "—",
@@ -319,14 +357,6 @@ struct TrendsView: View {
     }
 
     // MARK: - Reusable components
-
-    private func card<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content()
-            .padding(16)
-            .background(Color.white.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .padding(.horizontal)
-    }
 
     private func label(_ text: String) -> some View {
         Text(text)

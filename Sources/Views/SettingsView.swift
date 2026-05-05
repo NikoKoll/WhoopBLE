@@ -16,6 +16,8 @@ struct SettingsView: View {
     @EnvironmentObject var ble: BLEManager
     @Environment(\.openURL) private var openURL
     @State private var showClearConfirm = false
+    @State private var redetectStatus: String? = nil
+    @State private var redetectRunning = false
     @AppStorage("userWeightKg") private var userWeightKg: Double = 78
     @AppStorage("userAge")      private var userAge: Int        = 35
 
@@ -89,6 +91,26 @@ struct SettingsView: View {
             }
 
             Section("Data") {
+                Button {
+                    redetectRunning = true
+                    redetectStatus = nil
+                    Task {
+                        let n = await ble.redetectSleepFromStoredHR(daysBack: 2)
+                        redetectStatus = n > 0 ? "Found \(n) new session(s)" : "No new sessions found"
+                        redetectRunning = false
+                    }
+                } label: {
+                    HStack {
+                        Text(redetectRunning ? "Re-detecting…" : "Re-detect Sleep from History")
+                        Spacer()
+                        if redetectRunning { ProgressView().scaleEffect(0.7) }
+                    }
+                }
+                .disabled(redetectRunning)
+                if let s = redetectStatus {
+                    Text(s).font(.caption).foregroundStyle(.secondary)
+                }
+
                 Button("Clear Sleep Data & Re-sync", role: .destructive) {
                     showClearConfirm = true
                 }

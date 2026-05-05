@@ -308,6 +308,26 @@ final class HealthKitWriter {
 
     // appleExerciseTime is read-only (Apple Watch exclusive) — cannot be written by third-party apps.
 
+    // Delete sleep entries written by this app whose start is on/after `cutoff`.
+    func deleteSleepSamples(after cutoff: Date) {
+        let type = HKCategoryType(.sleepAnalysis)
+        let appPred  = HKQuery.predicateForObjects(from: HKSource.default())
+        let datePred = HKQuery.predicateForSamples(withStart: cutoff, end: nil, options: [])
+        let pred = NSCompoundPredicate(andPredicateWithSubpredicates: [appPred, datePred])
+        let query = HKSampleQuery(sampleType: type, predicate: pred,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: nil) { [weak self] _, samples, _ in
+            guard let samples, !samples.isEmpty else {
+                print("[HealthKit] no sleep samples to delete after \(cutoff)")
+                return
+            }
+            self?.store.delete(samples) { _, error in
+                if let error { print("[HealthKit] sleep delete-after error: \(error.localizedDescription)") }
+                else { print("[HealthKit] deleted \(samples.count) sleep entry(s) after \(cutoff)") }
+            }
+        }
+        store.execute(query)
+    }
+
     // MARK: - Delete sleep entries written by this app
     func deleteSleepSamples() {
         let type = HKCategoryType(.sleepAnalysis)

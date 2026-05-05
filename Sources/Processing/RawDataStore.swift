@@ -22,7 +22,7 @@ actor RawDataStore {
 
     init() {
         docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        pruneOlderThan(days: 90)
+        pruneOlderThan(days: 14)
         startPeriodicFlush()
     }
 
@@ -34,14 +34,12 @@ actor RawDataStore {
         guard timestamp - lastHRTimestamp >= 30 else { return }
         lastHRTimestamp = timestamp
         hrBuffer.append((isoDate(from: timestamp), HRSample(timestamp: timestamp, bpm: bpm)))
-        print("[Raw] HR appended ts=\(timestamp) bpm=\(bpm)")
     }
 
     /// Live RR interval — unthrottled; actor validates range.
     func appendRR(timestamp: Int, intervalMs: Int) {
         guard intervalMs >= 300, intervalMs <= 2000 else { return }
         rrBuffer.append((isoDate(from: timestamp), RRSample(timestamp: timestamp, intervalMs: intervalMs)))
-        print("[Raw] RR appended ts=\(timestamp) ms=\(intervalMs)")
     }
 
     /// Historical HR from batch sync — no 30 s throttle; all samples stored.

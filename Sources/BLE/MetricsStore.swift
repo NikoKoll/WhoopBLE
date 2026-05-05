@@ -36,6 +36,9 @@ final class MetricsStore: ObservableObject {
     @Published private(set) var dailySteps: [DailySteps] = []
     private let stepsURL: URL
 
+    // Cached daySummaries — invalidated only when entries or dailySteps actually mutate.
+    private var cachedSummaries: [DaySummary]?
+
     // MARK: - Init
 
     init() {
@@ -53,6 +56,7 @@ final class MetricsStore: ObservableObject {
         lastSavedTimestamp = timestamp
         entries.append(Entry(timestamp: timestamp, heartRate: heartRate, hrv: hrv))
         pruneEntries()
+        cachedSummaries = nil
         saveEntries()
     }
 
@@ -81,6 +85,7 @@ final class MetricsStore: ObservableObject {
             dailySteps.append(DailySteps(id: day, steps: count))
             dailySteps.sort { $0.id < $1.id }
         }
+        cachedSummaries = nil
         saveSteps()
     }
 
@@ -96,14 +101,16 @@ final class MetricsStore: ObservableObject {
     }
 
     var daySummaries: [DaySummary] {
+        if let cached = cachedSummaries { return cached }
         let cal = Calendar.current
         let grouped = Dictionary(grouping: entries) { cal.startOfDay(for: $0.timestamp) }
-        let allDays = Set(grouped.keys).union(Set(dailySteps.map(\.id)))
-        return allDays.compactMap { day -> DaySummary? in
-            let es  = grouped[day] ?? []
+        let stepsByDay = Dictionary(uniqueKeysWithValues: dailySteps.map { ($0.id, $0.steps) })
+        let allDays = Set(grouped.keys).union(stepsByDay.keys)
+        let result = allDays.compactMap { day -> DaySummary? in
+            let es = grouped[day] ?? []
             let hrs = es.map(\.heartRate)
             let hrvs = es.compactMap(\.hrv)
-            let steps = dailySteps.first(where: { $0.id == day })?.steps
+            let steps = stepsByDay[day]
             guard !hrs.isEmpty || steps != nil else { return nil }
             if hrs.isEmpty {
                 return DaySummary(id: day, avgHR: 0, minHR: 0, maxHR: 0, avgHRV: nil, steps: steps)
@@ -117,6 +124,8 @@ final class MetricsStore: ObservableObject {
                 steps: steps
             )
         }.sorted { $0.id < $1.id }
+        cachedSummaries = result
+        return result
     }
 
     var last24hEntries: [Entry] {
@@ -133,7 +142,9 @@ final class MetricsStore: ObservableObject {
 
     private func pruneEntries() {
         let cutoff = Date().addingTimeInterval(-maxAge)
+        let before = entries.count
         entries = entries.filter { $0.timestamp > cutoff }
+        if entries.count != before { cachedSummaries = nil }
     }
 
     private func loadEntries() {

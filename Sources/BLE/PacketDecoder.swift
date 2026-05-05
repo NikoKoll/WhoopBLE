@@ -15,11 +15,7 @@ enum PacketDecoder {
         // [0-3] header | [4-7] WHOOP internal timestamp | [8-9] Metric1 | [10] HR | [11] RR count
         // Note: bytes[10] ≈ 0xe2 (WHOOP clock high byte) on observed 0x57 packets — consistently
         // rejected by the heartRate guard below. HR comes from std HR service (0x2A37) in practice.
-        let metric1 = UInt16(bytes[8]) | UInt16(bytes[9]) << 8
         let heartRate = Int(bytes[10])
-        // Log metric1 every packet — per HANDOFF TODO #1, bytes[8-9] may be device step count.
-        // Walk 50 steps and watch whether metric1 increments proportionally.
-        print("📊 metric1=\(metric1) hr_raw=\(heartRate)")
         guard heartRate >= 30, heartRate <= 220 else { return nil }
 
         let rrCount = min(Int(bytes[11]), 4)

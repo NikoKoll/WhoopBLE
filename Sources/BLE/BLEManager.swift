@@ -141,6 +141,11 @@ final class BLEManager: NSObject, ObservableObject {
     nonisolated(unsafe) private var heartbeatTask: Task<Void, Never>?
     // Fires if we reach .streaming but receive no data within 25s — strap is silent, reconnect.
     nonisolated(unsafe) private var silenceWatchdog: Task<Void, Never>?
+    // Tracks whether we've performed the CCCD off→on cycle on 61080003 this session.
+    // Forces strap-side notification state to re-init in case a stale CCCD from a prior
+    // session is wedging the ACK channel.
+    nonisolated(unsafe) private var cmdFromCccdCycled: Bool = false
+    nonisolated(unsafe) private var enableTask: Task<Void, Never>?
 
     override init() {
         super.init()
@@ -289,6 +294,90 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Re-detect sleep from stored HR
+    //
+    // Re-runs SleepDetector over already-stored HR samples for the last N days. Used when
+    // the algorithm has been updated but the strap-side batch cursor has already advanced
+    // past the relevant data, so re-syncing won't deliver the same batches again. Detected
+    // sessions are deduped against existing `syncManager.sleepSessions` and merged into
+    // the same UI-backed list + HealthKit + DailyMetrics recompute queue.
+    func redetectSleepFromStoredHR(daysBack: Int = 2) async -> Int {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let today = cal.startOfDay(for: Date())
+        var newSessions: [SleepSession] = []
+        var affectedDates: [Date] = []
+
+        // Purge stale sessions in the redetect window FIRST so dedupe doesn't shadow new
+        // detections produced by the updated algorithm. Cutoff = start of (today - daysBack).
+        let purgeFrom = cal.date(byAdding: .day, value: -daysBack, to: today) ?? today
+        let removed = syncManager.removeSleepSessions(after: purgeFrom)
+        healthKit.deleteSleepSamples(after: purgeFrom)
+        print("[Redetect] purge cutoff=\(purgeFrom) — removed \(removed) stored session(s)")
+
+        for offset in 0...daysBack {
+            guard let dayStart = cal.date(byAdding: .day, value: -offset, to: today) else { continue }
+            let dayEnd     = cal.date(byAdding: .day,  value:  1, to: dayStart) ?? dayStart
+            let prevDay    = cal.date(byAdding: .day,  value: -1, to: dayStart) ?? dayStart
+            let nightStart = cal.date(byAdding: .hour, value: 18, to: prevDay)  ?? prevDay
+            let nightEnd   = cal.date(byAdding: .hour, value: 12, to: dayStart) ?? dayStart
+
+            await rawDataStore.flush()
+            let hrToday = await rawDataStore.loadHR(for: dayStart)
+            let hrPrev  = await rawDataStore.loadHR(for: prevDay)
+
+            let nightHR = (hrPrev + hrToday).filter {
+                let t = Date(timeIntervalSince1970: Double($0.timestamp))
+                return t >= nightStart && t < nightEnd
+            }.sorted { $0.timestamp < $1.timestamp }
+
+            guard nightHR.count >= 30 else { continue }
+
+            let historical = nightHR.map {
+                HistoricalSample(
+                    timestamp: Date(timeIntervalSince1970: Double($0.timestamp)),
+                    heartRate: $0.bpm,
+                    accelerometer: nil
+                )
+            }
+            let raw = SleepDetector().process(historical)
+
+            let detected = raw
+                .filter { $0.end >= dayStart && $0.end < dayEnd }
+                .filter { $0.end.timeIntervalSince($0.start) >= 1800 }
+                .filter { $0.end.timeIntervalSince($0.start) <= 14 * 3600 }
+
+            for s in detected {
+                let dup = syncManager.sleepSessions.contains {
+                    abs($0.start.timeIntervalSince(s.start)) < 3600
+                }
+                let alreadyQueued = newSessions.contains {
+                    abs($0.start.timeIntervalSince(s.start)) < 3600
+                }
+                if !dup && !alreadyQueued {
+                    newSessions.append(s)
+                    affectedDates.append(dayStart)
+                }
+            }
+        }
+
+        guard !newSessions.isEmpty else { return 0 }
+
+        for s in newSessions { syncManager.addSleepSession(s) }
+        healthKit.writeSleep(newSessions)
+
+        // Trigger recompute of affected days so DailyMetrics rows pick up new sleepMinutes.
+        let uniqueDates = Array(Set(affectedDates))
+        await recomputeQueue.configure(healthKit: healthKit)
+        await recomputeQueue.enqueue(dates: uniqueDates,
+                                     rawStore: rawDataStore,
+                                     dailyStore: dailyMetrics) { [weak self] in
+            await self?.refreshRecoveryFromStore()
+        }
+        print("[Redetect] added \(newSessions.count) session(s), recompute queued for \(uniqueDates.count) date(s)")
+        return newSessions.count
+    }
+
     private func parseISODateString(_ str: String) -> Date? {
         let parts = str.split(separator: "-").compactMap { Int($0) }
         guard parts.count == 3 else { return nil }
@@ -319,6 +408,8 @@ final class BLEManager: NSObject, ObservableObject {
         stalenessTask?.cancel(); stalenessTask = nil
         heartbeatTask?.cancel(); heartbeatTask = nil
         silenceWatchdog?.cancel(); silenceWatchdog = nil
+        enableTask?.cancel(); enableTask = nil
+        cmdFromCccdCycled = false
     }
 
     // MARK: - Activity ring accumulation
@@ -410,9 +501,10 @@ final class BLEManager: NSObject, ObservableObject {
             self.hrHistory.append(metrics)
             if self.hrHistory.count > 60 { self.hrHistory.removeFirst() }
 
-            // 15-sample smoothed HR (~15 s window at 1 Hz)
+            // 15-sample smoothed HR (~15 s window at 1 Hz). Skip publish if unchanged.
             let window = self.hrHistory.suffix(15)
-            self.smoothedHR = window.map(\.heartRate).reduce(0, +) / window.count
+            let newSmoothed = window.map(\.heartRate).reduce(0, +) / window.count
+            if newSmoothed != self.smoothedHR { self.smoothedHR = newSmoothed }
 
             // Rolling RR buffer — append valid intervals, cap at 60 values (~1 min)
             for rr in metrics.rrIntervals where rr >= 0.3 && rr <= 2.0 {
@@ -663,38 +755,91 @@ extension BLEManager: CBPeripheralDelegate {
         }
         print("🔔 notify \(characteristic.isNotifying ? "ON" : "OFF") for \(uuid.prefix(8))")
 
-        // Trigger on EVENTS (61080004) — original working sequence.
-        guard uuid.hasPrefix(WUUID.events),
-              characteristic.isNotifying,
-              !enableSent,
-              let char = self.cmdToStrap else { return }
-        enableSent = true
-        peripheral.writeValue(WhoopCRC.enableHealth, for: char, type: .withoutResponse)
-        // Request HR broadcast on standard BLE HR service (0x180D / 0x2A37).
-        peripheral.writeValue(WhoopCRC.enableHRBroadcast, for: char, type: .withoutResponse)
-        // Query wrist/charging status — ACK parsed in SyncManager (cmd_echo=0x35).
-        peripheral.writeValue(WhoopCRC.getHelloHarvard, for: char, type: .withoutResponse)
-        print("📤 enableHealth + enableHRBroadcast + getHelloHarvard sent")
+        // Gate enable sequence on CMD_FROM_STRAP (61080003) being live, not EVENTS.
+        // Writes to 61080002 before the ACK channel's CCCD has settled on the strap side
+        // can leave the strap unable to route 0xfc replies — observed as silent ACK channel
+        // post-fuzzing. EVENTS notifying tells us nothing about whether the strap is
+        // ready to deliver command responses.
+        guard uuid.hasPrefix(WUUID.cmdFrom), self.cmdToStrap != nil else { return }
 
-        // Send (0x03, 0x02) at 5s. In every working session this was present alongside
-        // enableHealth; removing it caused total silence from the strap.
-        // Also trigger historical sync at the same point once the strap is settled.
-        Task { [weak self] in
-            do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch { return }
-            guard let self, let p = self.peripheral, let c = self.cmdToStrap else { return }
-            self.bleQueue.async { p.writeValue(WhoopCRC.buildCommand(category: 0x03, value: 0x02), for: c, type: .withoutResponse) }
-            self.bleQueue.async { p.writeValue(WhoopCRC.toggleIMUHistorical, for: c, type: .withoutResponse) }
+        // CCCD off→on cycle on 61080003. First isNotifying=true → write 0x0000.
+        // Resulting isNotifying=false → 500 ms delay → re-write 0x0100. Second
+        // isNotifying=true → drop into the enable burst. Forces strap-side ACK channel
+        // re-init when a stale CCCD from a prior session is suspected.
+        if characteristic.isNotifying && !cmdFromCccdCycled {
+            cmdFromCccdCycled = true
+            print("🔁 CCCD cycle on 61080003 — disabling")
+            peripheral.setNotifyValue(false, for: characteristic)
+            return
+        }
+        if !characteristic.isNotifying && cmdFromCccdCycled && !enableSent {
+            print("🔁 CCCD cycle on 61080003 — re-enabling in 500ms")
+            Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+                guard let self, let p = self.peripheral, let c = self.cmdFromStrap else { return }
+                p.setNotifyValue(true, for: c)
+            }
+            return
+        }
+        guard characteristic.isNotifying, cmdFromCccdCycled, !enableSent else { return }
+        enableSent = true
+
+        // Sequenced enable burst:
+        //   t=0       (after 500ms settle): enableHealth (withResponse — forces ATT ack)
+        //   t=+250ms : enableHRBroadcast
+        //   t=+500ms : getHelloHarvard
+        //   t=+5s    : (0x03,0x02) + IMU historical + syncManager.onConnected()
+        // 250ms inter-cmd spacing avoids overrunning the strap parser.
+        enableTask?.cancel()
+        enableTask = Task { [weak self] in
+            // Each step verifies (a) the Task wasn't cancelled (e.g. by disconnect →
+            // clearPeripheralState) and (b) the peripheral is still connected. Without
+            // these guards CBPeripheral logs "API MISUSE" when a write fires post-disconnect.
+            func stillLive(_ s: BLEManager) -> (CBPeripheral, CBCharacteristic)? {
+                guard !Task.isCancelled,
+                      let p = s.peripheral,
+                      let c = s.cmdToStrap,
+                      p.state == .connected else { return nil }
+                return (p, c)
+            }
+
+            do { try await Task.sleep(nanoseconds: 500_000_000) } catch { return }
+            guard let self, let (p0, c0) = stillLive(self) else { return }
+            self.bleQueue.async { p0.writeValue(WhoopCRC.enableHealth, for: c0, type: .withResponse) }
+            print("📤 enableHealth sent (withResponse)")
+
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+            guard let (p1, c1) = stillLive(self) else { return }
+            self.bleQueue.async { p1.writeValue(WhoopCRC.enableHRBroadcast, for: c1, type: .withoutResponse) }
+            print("📤 enableHRBroadcast sent")
+
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+            guard let (p2, c2) = stillLive(self) else { return }
+            self.bleQueue.async { p2.writeValue(WhoopCRC.getHelloHarvard, for: c2, type: .withoutResponse) }
+            print("📤 getHelloHarvard sent")
+
+            do { try await Task.sleep(nanoseconds: 4_000_000_000) } catch { return }
+            guard let (p3, c3) = stillLive(self) else { return }
+            self.bleQueue.async { p3.writeValue(WhoopCRC.buildCommand(category: 0x03, value: 0x02), for: c3, type: .withoutResponse) }
+            do { try await Task.sleep(nanoseconds: 250_000_000) } catch { return }
+            guard let (p4, c4) = stillLive(self) else { return }
+            self.bleQueue.async { p4.writeValue(WhoopCRC.toggleIMUHistorical, for: c4, type: .withoutResponse) }
             print("▶️ (0x03,0x02) + IMU historical enable sent")
             await MainActor.run { self.syncManager.onConnected() }
         }
 
         // Heartbeat every 10s.
         heartbeatTask = Task { [weak self] in
+            var beatCount = 0
             while !Task.isCancelled {
                 do { try await Task.sleep(nanoseconds: 10_000_000_000) } catch { return }
                 guard let self, let p = self.peripheral, let c = self.cmdToStrap else { return }
                 self.bleQueue.async { p.writeValue(WhoopCRC.keepaliveHealth, for: c, type: .withoutResponse) }
-                print("💓 keepalive sent")
+                beatCount += 1
+                // Re-read battery every 60 s (every 6th heartbeat)
+                if beatCount % 6 == 0, let bat = self.batteryChar {
+                    self.bleQueue.async { p.readValue(for: bat) }
+                }
             }
         }
 
@@ -710,6 +855,15 @@ extension BLEManager: CBPeripheralDelegate {
         }
     }
 
+    // .withResponse writes (currently just enableHealth) report success/failure here.
+    nonisolated func peripheral(_ peripheral: CBPeripheral,
+                                didWriteValueFor characteristic: CBCharacteristic,
+                                error: Error?) {
+        if let error {
+            print("❌ write failed for \(characteristic.uuid.uuidString.prefix(8)): \(error.localizedDescription)")
+        }
+    }
+
     nonisolated func peripheral(_ peripheral: CBPeripheral,
                                 didUpdateValueFor characteristic: CBCharacteristic,
                                 error: Error?) {
@@ -721,7 +875,6 @@ extension BLEManager: CBPeripheralDelegate {
         // CoreBluetooth returns short 16-bit UUIDs as "2A19", not the full 128-bit form.
         if uuidShort.hasPrefix("2a19") {
             if let val = data.first {
-                print("🔋 battery: \(val)%")
                 Task { @MainActor [weak self] in self?.batteryLevel = Int(val) }
             }
             return
@@ -761,17 +914,11 @@ extension BLEManager: CBPeripheralDelegate {
                 print("⚠️ std HR jump \(lastDecodedHR)→\(hr) rejected"); return
             }
             lastDecodedHR = hr
-            print("❤️‍🔥 std HR: \(hr) BPM")
             acceptMetrics(WhoopMetrics(timestamp: Date(), heartRate: hr, rrIntervals: rrIntervals))
             return
         }
 
-        let hex = data.map { String(format: "%02x", $0) }.joined(separator: " ")
-        print("📡 [\(uuidShort)] \(data.count) bytes: \(hex)")
-
         if uuidShort.hasPrefix(WUUID.cmdFrom) {
-            print("📨 CMD_FROM_STRAP: \(hex)")
-            // Also route through SyncManager — batch acks may arrive here, not on DATA_FROM_STRAP
             let bytes = [UInt8](data)
             Task { @MainActor [weak self] in self?.syncManager.handleDataPacket(bytes) }
             return

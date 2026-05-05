@@ -1,19 +1,90 @@
 import SwiftUI
 
+// MARK: - Animation helper
+
+private extension Animation {
+    static func smoothFallback(duration: Double = 0.45) -> Animation {
+        if #available(iOS 17.0, *) { return .smooth(duration: duration) }
+        return .easeInOut(duration: duration)
+    }
+}
+
+// MARK: - Card container (mirrors DashboardView.DashCard)
+
+private struct SleepCard<Content: View>: View {
+    let content: Content
+    init(@ViewBuilder _ content: () -> Content) { self.content = content() }
+
+    var body: some View {
+        content
+            .padding(.vertical, 14)
+            .padding(.horizontal, 18)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5)
+                    )
+            )
+    }
+}
+
+// MARK: - Sleep stage colors
+
+private enum StageStyle {
+    static func color(_ stage: SleepStage) -> Color {
+        switch stage {
+        case .deep:  return Color(red: 0.32, green: 0.20, blue: 0.78)
+        case .core:  return Color(red: 0.42, green: 0.45, blue: 0.95)
+        case .rem:   return Color(red: 0.55, green: 0.78, blue: 1.00)
+        case .awake: return Color.orange.opacity(0.85)
+        }
+    }
+    static func label(_ stage: SleepStage) -> String {
+        switch stage {
+        case .deep:  return "Deep"
+        case .core:  return "Core"
+        case .rem:   return "REM"
+        case .awake: return "Awake"
+        }
+    }
+}
+
+// MARK: - SleepView
+
 struct SleepView: View {
     @ObservedObject var sync: SyncManager
     @EnvironmentObject var ble: BLEManager
 
-    // date key → sleepNeedMinutes loaded from DailyMetricsStore
     @State private var needByDate: [String: Int] = [:]
+
+    private var sortedSessions: [SleepSession] {
+        sync.sleepSessions.sorted { $0.start > $1.start }
+    }
+    private var lastNight: SleepSession? { sortedSessions.first }
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
-            if sync.sleepSessions.isEmpty {
-                emptyState
-            } else {
-                sessionList
+            backgroundLayer
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 16) {
+                    if sync.isSyncing { syncBanner }
+
+                    if let last = lastNight {
+                        SleepCard { lastNightHeader(last) }
+                        SleepCard { statsRow(last) }
+                    } else {
+                        SleepCard { emptyState }
+                    }
+
+                    if sortedSessions.count > 1 {
+                        SleepCard { historyList }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 32)
             }
         }
         .navigationTitle("Sleep")
@@ -24,7 +95,322 @@ struct SleepView: View {
         }
     }
 
-    // MARK: - Data loading
+    // MARK: - Background
+
+    private var backgroundLayer: some View {
+        ZStack {
+            Color.black
+            RadialGradient(
+                colors: [Color.indigo.opacity(0.28), .clear],
+                center: .init(x: 0.5, y: 0.18),
+                startRadius: 0,
+                endRadius: 380
+            )
+            .blendMode(.plusLighter)
+        }
+        .ignoresSafeArea()
+    }
+
+    // MARK: - Sync banner
+
+    private var syncBanner: some View {
+        HStack(spacing: 8) {
+            ProgressView().scaleEffect(0.6).tint(.cyan)
+            Text("Syncing history…")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.cyan)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(
+            Capsule().fill(.ultraThinMaterial)
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.07), lineWidth: 0.5))
+        )
+    }
+
+    // MARK: - Empty state
+
+    private var emptyState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "moon.zzz.fill")
+                .font(.system(size: 52))
+                .foregroundStyle(.indigo.opacity(0.6))
+            Text("No sleep data yet")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
+            Text("Sleep sessions are detected from synced WHOOP history.\nConnect your strap to start syncing.")
+                .font(.caption)
+                .foregroundStyle(.gray)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 18)
+    }
+
+    // MARK: - Last night header (big ring + summary)
+
+    @ViewBuilder
+    private func lastNightHeader(_ session: SleepSession) -> some View {
+        let durSec = Int(session.end.timeIntervalSince(session.start))
+        let need   = needByDateKey(for: session)
+        let pct    = sleepPercent(durSec: durSec, need: need)
+        let color  = qualityColor(durSec: durSec, need: need)
+
+        HStack(spacing: 18) {
+            sleepRing(pct: pct, color: color)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Last Night")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                    .kerning(1.6)
+                Text(durationText(durSec))
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .contentTransition(.numericText())
+                if let n = need {
+                    Text("of \(durationText(n * 60)) needed")
+                        .font(.caption)
+                        .foregroundStyle(.gray)
+                }
+                Text(timeRangeText(session))
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.5))
+                    .padding(.top, 2)
+            }
+            Spacer()
+        }
+    }
+
+    private func sleepRing(pct: Int?, color: Color) -> some View {
+        ZStack {
+            Circle()
+                .fill(color.opacity(pct == nil ? 0 : 0.14))
+                .frame(width: 110, height: 110)
+                .blur(radius: 18)
+            Circle()
+                .stroke(Color.white.opacity(0.08), lineWidth: 9)
+                .frame(width: 96, height: 96)
+            Circle()
+                .trim(from: 0, to: min(Double(pct ?? 0) / 100.0, 1.0))
+                .stroke(
+                    AngularGradient(
+                        colors: [color.opacity(0.45), color, color.opacity(0.85)],
+                        center: .center, startAngle: .degrees(-90), endAngle: .degrees(270)
+                    ),
+                    style: StrokeStyle(lineWidth: 9, lineCap: .round)
+                )
+                .frame(width: 96, height: 96)
+                .rotationEffect(.degrees(-90))
+                .shadow(color: color.opacity(0.5), radius: 6)
+                .animation(.smoothFallback(duration: 0.6), value: pct)
+
+            VStack(spacing: 1) {
+                Text(pct.map { "\($0)%" } ?? "—")
+                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                    .foregroundStyle(color)
+                Text("SLEEP")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(color.opacity(0.8))
+                    .kerning(1.2)
+            }
+        }
+    }
+
+    // MARK: - Stats row (last night)
+
+    private func statsRow(_ session: SleepSession) -> some View {
+        let durSec = Int(session.end.timeIntervalSince(session.start))
+        let wakeSec = session.briefWakeTotalSeconds
+        let asleepSec = max(0, durSec - wakeSec)
+        let eff = durSec > 0 ? Int(Double(asleepSec) / Double(durSec) * 100) : 0
+        let stages = session.stages ?? []
+
+        return VStack(spacing: 12) {
+            HStack(spacing: 0) {
+                statTile(label: "EFFICIENCY", value: "\(eff)%", color: .green)
+                divider
+                statTile(label: "WAKES",      value: "\(session.briefWakeCount)", color: .orange)
+                divider
+                statTile(label: "AWAKE",      value: shortDuration(wakeSec), color: .yellow)
+            }
+            if !stages.isEmpty {
+                stageBar(stages: stages, totalSec: durSec)
+                stageLegend(stages: stages, totalSec: durSec)
+            }
+        }
+    }
+
+    private var divider: some View {
+        Rectangle().fill(Color.white.opacity(0.08)).frame(width: 1, height: 32)
+    }
+
+    private func statTile(label: String, value: String, color: Color) -> some View {
+        VStack(spacing: 4) {
+            Text(value)
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+                .foregroundStyle(color)
+            Text(label)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.45))
+                .kerning(1.5)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - Stage breakdown bar
+
+    private func stageBar(stages: [SleepStageSegment], totalSec: Int) -> some View {
+        GeometryReader { geo in
+            HStack(spacing: 1) {
+                ForEach(Array(stages.enumerated()), id: \.offset) { _, seg in
+                    let dur = max(1.0, seg.end.timeIntervalSince(seg.start))
+                    let frac = dur / Double(max(totalSec, 1))
+                    Rectangle()
+                        .fill(StageStyle.color(seg.stage))
+                        .frame(width: max(2, geo.size.width * frac))
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        }
+        .frame(height: 14)
+    }
+
+    private func stageLegend(stages: [SleepStageSegment], totalSec: Int) -> some View {
+        let totals = stageTotals(stages)
+        return HStack(spacing: 12) {
+            ForEach([SleepStage.deep, .core, .rem, .awake], id: \.self) { stage in
+                let secs = totals[stage] ?? 0
+                if secs > 0 {
+                    HStack(spacing: 5) {
+                        Circle().fill(StageStyle.color(stage)).frame(width: 7, height: 7)
+                        Text(StageStyle.label(stage))
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.7))
+                        Text(shortDuration(secs))
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundStyle(StageStyle.color(stage))
+                    }
+                }
+            }
+            Spacer()
+        }
+    }
+
+    private func stageTotals(_ stages: [SleepStageSegment]) -> [SleepStage: Int] {
+        var out: [SleepStage: Int] = [:]
+        for s in stages {
+            out[s.stage, default: 0] += Int(s.end.timeIntervalSince(s.start))
+        }
+        return out
+    }
+
+    // MARK: - History list (older sessions)
+
+    private var historyList: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("HISTORY")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.45))
+                .kerning(1.6)
+            ForEach(Array(sortedSessions.dropFirst()), id: \.start) { session in
+                historyRow(session)
+                if session.start != sortedSessions.last?.start {
+                    Divider().background(Color.white.opacity(0.06))
+                }
+            }
+        }
+    }
+
+    private func historyRow(_ session: SleepSession) -> some View {
+        let durSec = Int(session.end.timeIntervalSince(session.start))
+        let need   = needByDateKey(for: session)
+        let color  = qualityColor(durSec: durSec, need: need)
+
+        return HStack(spacing: 12) {
+            Circle()
+                .fill(color.opacity(0.18))
+                .frame(width: 36, height: 36)
+                .overlay(
+                    Image(systemName: "moon.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(color)
+                )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(session.start.formatted(date: .abbreviated, time: .omitted))
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text(timeRangeText(session))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(durationText(durSec))
+                    .font(.system(size: 14, weight: .bold, design: .rounded))
+                    .foregroundStyle(color)
+                if let n = need {
+                    Text("/ \(durationText(n * 60))")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Helpers
+
+    private func needByDateKey(for session: SleepSession) -> Int? {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let c = cal.dateComponents([.year, .month, .day], from: session.end)
+        let key = String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
+        return needByDate[key]
+    }
+
+    private func sleepPercent(durSec: Int, need: Int?) -> Int? {
+        guard let n = need, n > 0 else {
+            let hrs = Double(durSec) / 3600
+            return Int(min(100, hrs / 8.0 * 100))
+        }
+        return Int(min(100.0, Double(durSec) / Double(n * 60) * 100.0))
+    }
+
+    private func qualityColor(durSec: Int, need: Int?) -> Color {
+        if let n = need, n > 0 {
+            let ratio = Double(durSec) / Double(n * 60)
+            if ratio >= 0.85 { return .green }
+            if ratio >= 0.70 { return .yellow }
+            return .red
+        }
+        let hours = Double(durSec) / 3600
+        if hours >= 7 { return .green }
+        if hours >= 5 { return .yellow }
+        return .red
+    }
+
+    private func durationText(_ secs: Int) -> String {
+        let h = secs / 3600, m = (secs % 3600) / 60
+        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
+    }
+
+    private func shortDuration(_ secs: Int) -> String {
+        if secs < 60 { return "\(secs)s" }
+        let h = secs / 3600, m = (secs % 3600) / 60
+        return h > 0 ? "\(h)h\(m)m" : "\(m)m"
+    }
+
+    private func timeRangeText(_ session: SleepSession) -> String {
+        "\(session.start.formatted(date: .omitted, time: .shortened)) → \(session.end.formatted(date: .omitted, time: .shortened))"
+    }
+
+    // MARK: - Data
 
     private func loadNeedData() async {
         let all = await ble.dailyMetrics.loadAll()
@@ -33,221 +419,5 @@ struct SleepView: View {
             if let n = m.sleepNeedMinutes { dict[m.date] = n }
         }
         needByDate = dict
-    }
-
-    // MARK: - Empty State
-
-    private var emptyState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "moon.zzz.fill")
-                .font(.system(size: 52))
-                .foregroundStyle(.indigo.opacity(0.55))
-            Text("No sleep data yet")
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.white)
-            Text("Sleep sessions are detected from synced WHOOP history.\nConnect your strap to start syncing.")
-                .font(.caption)
-                .foregroundStyle(.gray)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 40)
-            if sync.isSyncing {
-                HStack(spacing: 6) {
-                    ProgressView().scaleEffect(0.6).tint(.cyan)
-                    Text("Syncing history…")
-                        .font(.caption2)
-                        .foregroundStyle(.cyan)
-                }
-                .padding(.top, 4)
-            }
-        }
-    }
-
-    // MARK: - Session List
-
-    private var sessionList: some View {
-        ScrollView {
-            VStack(spacing: 1) {
-                if sync.isSyncing {
-                    HStack(spacing: 6) {
-                        ProgressView().scaleEffect(0.55).tint(.cyan)
-                        Text("Still syncing…")
-                            .font(.caption2)
-                            .foregroundStyle(.cyan)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 8)
-                }
-                ForEach(sync.sleepSessions.reversed(), id: \.start) { session in
-                    SleepSessionRow(session: session, needMinutes: needByDateKey(for: session))
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                    Divider()
-                        .background(Color.white.opacity(0.07))
-                        .padding(.horizontal, 16)
-                }
-            }
-            .padding(.top, 8)
-        }
-    }
-
-    // Maps a session's wake date (UTC ISO "yyyy-MM-dd") to its stored sleep need.
-    private func needByDateKey(for session: SleepSession) -> Int? {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        let c = cal.dateComponents([.year, .month, .day], from: session.end)
-        let key = String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
-        return needByDate[key]
-    }
-}
-
-// MARK: - Session Row
-
-private struct SleepSessionRow: View {
-    let session: SleepSession
-    let needMinutes: Int?
-
-    @State private var expanded = false
-
-    private var durationSecs: Int { Int(session.end.timeIntervalSince(session.start)) }
-
-    private var durationText: String {
-        let h = durationSecs / 3600
-        let m = (durationSecs % 3600) / 60
-        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
-    }
-
-    private var timeRangeText: String {
-        "\(session.start.formatted(date: .omitted, time: .shortened)) → \(session.end.formatted(date: .omitted, time: .shortened))"
-    }
-
-    private var badgeText: String {
-        var parts: [String] = []
-        if let need = needMinutes {
-            let nh = need / 60; let nm = need % 60
-            let needStr = nh > 0 ? "\(nh)h \(nm)m" : "\(nm)m"
-            parts.append("\(durationText) / \(needStr) needed")
-        } else {
-            parts.append(durationText)
-        }
-        let w = session.briefWakeCount
-        if w > 0 { parts.append("\(w) brief wake\(w == 1 ? "" : "s")") }
-        return parts.joined(separator: " · ")
-    }
-
-    private var qualityColor: Color {
-        if let need = needMinutes {
-            let ratio = Double(durationSecs) / Double(need * 60)
-            switch ratio {
-            case 0.9...: return .green
-            case 0.75...: return .yellow
-            default: return .orange
-            }
-        }
-        let hours = Double(durationSecs) / 3600
-        switch hours {
-        case 7...: return .green
-        case 5...: return .yellow
-        default: return .orange
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Main row
-            HStack(spacing: 14) {
-                ZStack {
-                    Circle()
-                        .fill(qualityColor.opacity(0.12))
-                        .frame(width: 44, height: 44)
-                    Image(systemName: "moon.fill")
-                        .font(.system(size: 20))
-                        .foregroundStyle(qualityColor)
-                }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(timeRangeText)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.white)
-                    Text(session.start.formatted(date: .abbreviated, time: .omitted))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(badgeText)
-                        .font(.caption2)
-                        .foregroundStyle(.gray)
-                }
-
-                Spacer()
-
-                VStack(alignment: .trailing, spacing: 6) {
-                    Circle()
-                        .fill(qualityColor)
-                        .frame(width: 10, height: 10)
-                    if needMinutes != nil {
-                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.gray)
-                    }
-                }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                guard needMinutes != nil else { return }
-                withAnimation(.easeInOut(duration: 0.2)) { expanded.toggle() }
-            }
-
-            // Expanded breakdown
-            if expanded, let need = needMinutes {
-                needBreakdown(need: need)
-                    .padding(.top, 12)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func needBreakdown(need: Int) -> some View {
-        // We only have total from DailyMetrics; we can't show component breakdown
-        // without re-running the calculator. Show a simple summary row instead.
-        let h = need / 60; let m = need % 60
-        let needStr = h > 0 ? "\(h)h \(m)m" : "\(m)m"
-        let dh = durationSecs / 3600; let dm = (durationSecs % 3600) / 60
-        let actualStr = dh > 0 ? "\(dh)h \(dm)m" : "\(dm)m"
-        let delta = durationSecs - need * 60
-        let absDeltaMin = abs(delta) / 60
-        let deltaStr = delta >= 0 ? "+\(absDeltaMin)m" : "-\(absDeltaMin)m"
-        let deltaColor: Color = delta >= 0 ? .green : .orange
-
-        VStack(alignment: .leading, spacing: 6) {
-            Divider().background(Color.white.opacity(0.08))
-            HStack {
-                Text("Slept")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(actualStr)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.white)
-            }
-            HStack {
-                Text("Need")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(needStr)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.white)
-            }
-            HStack {
-                Text("Balance")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(deltaStr)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(deltaColor)
-            }
-        }
-        .padding(.horizontal, 6)
     }
 }

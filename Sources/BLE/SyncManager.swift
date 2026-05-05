@@ -561,6 +561,19 @@ final class SyncManager: ObservableObject {
         UserDefaults.standard.set(data, forKey: sleepKey)
     }
 
+    // Removes sleep sessions whose start is on/after `cutoff`. Used by redetect path before
+    // re-running detector so stale sessions don't shadow new ones via dedupe.
+    func removeSleepSessions(after cutoff: Date) -> Int {
+        let before = sleepSessions.count
+        sleepSessions.removeAll { $0.start >= cutoff }
+        let removed = before - sleepSessions.count
+        if removed > 0 {
+            saveSleepSessions()
+            print("[SyncManager] removed \(removed) sleep session(s) on/after \(cutoff)")
+        }
+        return removed
+    }
+
     // Wipes all sleep sessions from app storage + HealthKit and clears the processed-batch
     // cache so every batch re-downloads on next connect.
     func clearAllSleepData() {

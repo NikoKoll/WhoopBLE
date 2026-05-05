@@ -5,8 +5,8 @@ import HealthKit
 enum AlgoVersions {
     static let hrv      = 3   // stage 2 deviation filter (§9.5): rejects RR >20% from rolling mean
     static let strain   = 3   // recalibrated zone weights — Z1 dropped to 0.1, maxStrain → 11
-    static let sleep    = 7   // REM threshold 20→15 BPM (P1 stage tuning)
-    static let recovery = 10  // recomputes downstream of new strain + sleep
+    static let sleep    = 8   // globalP5 baseline floor + DEEP-trim + 30min wake-absorb
+    static let recovery = 11  // recomputes downstream of new sleep boundaries
 }
 
 /// Pure compute functions + recomputeDay orchestrator.
