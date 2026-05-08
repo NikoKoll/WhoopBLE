@@ -48,32 +48,39 @@ struct SleepStageSegment: Sendable, Codable {
     let stage: SleepStage
 }
 
-struct SleepSession: Sendable, Codable {
+struct SleepSession: Sendable, Codable, Identifiable {
+    let id: String
     let start: Date
     let end: Date
     let stages: [SleepStageSegment]?
     let briefWakeCount: Int
     let briefWakeTotalSeconds: Int
+    let source: String   // "auto" or "manual"
 
     init(start: Date, end: Date, stages: [SleepStageSegment]? = nil,
-         briefWakeCount: Int = 0, briefWakeTotalSeconds: Int = 0) {
+         briefWakeCount: Int = 0, briefWakeTotalSeconds: Int = 0,
+         id: String = UUID().uuidString, source: String = "auto") {
+        self.id = id
         self.start = start
         self.end = end
         self.stages = stages
         self.briefWakeCount = briefWakeCount
         self.briefWakeTotalSeconds = briefWakeTotalSeconds
+        self.source = source
     }
 
-    // Custom decoder — legacy persisted sessions missing new keys decode to defaults.
     private enum CodingKeys: String, CodingKey {
-        case start, end, stages, briefWakeCount, briefWakeTotalSeconds
+        case id, start, end, stages, briefWakeCount, briefWakeTotalSeconds, source
     }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? UUID().uuidString
         self.start = try c.decode(Date.self, forKey: .start)
         self.end = try c.decode(Date.self, forKey: .end)
         self.stages = try c.decodeIfPresent([SleepStageSegment].self, forKey: .stages)
         self.briefWakeCount = (try? c.decodeIfPresent(Int.self, forKey: .briefWakeCount)) ?? 0
         self.briefWakeTotalSeconds = (try? c.decodeIfPresent(Int.self, forKey: .briefWakeTotalSeconds)) ?? 0
+        self.source = (try? c.decodeIfPresent(String.self, forKey: .source)) ?? "auto"
     }
 }

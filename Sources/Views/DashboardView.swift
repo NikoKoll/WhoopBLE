@@ -75,22 +75,32 @@ struct DashboardView: View {
     }
 
     // MARK: - Sleep ring computed values
+    private var sleepSessionMinutes: Int {
+        if let s = ble.lastSleepSession {
+            let total = Int(s.end.timeIntervalSince(s.start) / 60)
+            let wake = s.briefWakeTotalSeconds / 60
+            return max(0, total - wake)
+        }
+        return ble.todaySleepMinutes ?? 0
+    }
     private var sleepProgress: Double {
-        guard let got = ble.todaySleepMinutes,
+        guard sleepSessionMinutes > 0,
               let need = ble.todaySleepNeedMinutes, need > 0 else { return 0 }
-        return min(Double(got) / Double(need), 1.0)
+        return min(Double(sleepSessionMinutes) / Double(need), 1.0)
     }
     private var sleepPct: Int { Int(sleepProgress * 100) }
     private var sleepColor: Color {
-        guard ble.todaySleepMinutes != nil else { return .gray.opacity(0.35) }
+        guard ble.lastSleepSession != nil || ble.todaySleepMinutes != nil else { return .gray.opacity(0.35) }
         if sleepPct >= 85 { return .green }
         if sleepPct >= 70 { return .yellow }
         return .red
     }
     private var sleepSubtitle: String {
-        guard let mins = ble.todaySleepMinutes else { return "—" }
-        let h = mins / 60, m = mins % 60
-        return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+        if sleepSessionMinutes > 0 {
+            let h = sleepSessionMinutes / 60, m = sleepSessionMinutes % 60
+            return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+        }
+        return "—"
     }
 
     // MARK: - Strain ring computed values
@@ -322,7 +332,7 @@ struct DashboardView: View {
                 .animation(.smoothFallback(duration: 0.6), value: sleepProgress)
 
             VStack(spacing: 1) {
-                Text(ble.todaySleepMinutes != nil ? "\(sleepPct)%" : "—")
+                Text(ble.todaySleepMinutes != nil || ble.lastSleepSession != nil ? "\(sleepPct)%" : "—")
                     .font(.system(size: 20, weight: .bold, design: .rounded))
                     .foregroundStyle(sleepColor)
                     .contentTransition(.numericText())
@@ -605,6 +615,10 @@ struct DashboardView: View {
     }
 
     // MARK: - Helpers
+
+    private func timeRangeText(_ session: SleepSession) -> String {
+        return "\(session.start.formatted(date: .omitted, time: .shortened)) → \(session.end.formatted(date: .omitted, time: .shortened))"
+    }
 
     private var dotColor: Color {
         if ble.connectionState.isLive { return isStale ? .orange : .green }

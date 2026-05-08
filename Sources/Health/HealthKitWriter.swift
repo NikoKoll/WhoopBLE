@@ -346,6 +346,27 @@ final class HealthKitWriter {
         store.execute(query)
     }
 
+    // MARK: - Targeted sleep sample deletion by date range
+
+    func deleteSleepSamples(from start: Date, to end: Date) {
+        let type = HKCategoryType(.sleepAnalysis)
+        let appPred  = HKQuery.predicateForObjects(from: HKSource.default())
+        let datePred = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
+        let pred = NSCompoundPredicate(andPredicateWithSubpredicates: [appPred, datePred])
+        let query = HKSampleQuery(sampleType: type, predicate: pred,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: nil) { [weak self] _, samples, _ in
+            guard let samples, !samples.isEmpty else {
+                print("[HealthKit] no sleep samples to delete in range \(start) – \(end)")
+                return
+            }
+            self?.store.delete(samples) { _, error in
+                if let error { print("[HealthKit] sleep delete range error: \(error.localizedDescription)") }
+                else { print("[HealthKit] deleted \(samples.count) sleep sample(s) in range \(start) – \(end)") }
+            }
+        }
+        store.execute(query)
+    }
+
     // MARK: - Sleep analysis
     // Writes ONE asleepUnspecified HKCategorySample per session (full window).
     // Per-stage writing was removed — it produced one Health entry per stage segment,
@@ -358,8 +379,9 @@ final class HealthKitWriter {
         for session in sessions {
             let start = session.start
             let end   = session.end
-            guard end > start, end <= now.addingTimeInterval(3600) else {
-                print("[HealthKit] sleep session skipped: invalid range \(start) → \(end)")
+            // 5-min slack for genuine device-clock drift; blocks bogus far-future entries.
+            guard end > start, end <= now.addingTimeInterval(300) else {
+                print("[HealthKit] sleep session skipped: invalid range \(start) → \(end) (now=\(now))")
                 continue
             }
             let metadata: [String: Any] = [HKMetadataKeyTimeZone: TimeZone.current.identifier]

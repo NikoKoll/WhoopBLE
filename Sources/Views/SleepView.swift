@@ -58,6 +58,12 @@ struct SleepView: View {
     @EnvironmentObject var ble: BLEManager
 
     @State private var needByDate: [String: Int] = [:]
+    @State private var showCreateSheet = false
+    @State private var editingSession: SleepSession?
+    @State private var createStart = Calendar.current.date(bySettingHour: 23, minute: 0, second: 0, of: Date()) ?? Date()
+    @State private var createEnd = Calendar.current.date(bySettingHour: 7, minute: 0, second: 0, of: Date().addingTimeInterval(86400)) ?? Date()
+    @State private var editStart = Date()
+    @State private var editEnd = Date()
 
     private var sortedSessions: [SleepSession] {
         sync.sleepSessions.sorted { $0.start > $1.start }
@@ -89,9 +95,23 @@ struct SleepView: View {
         }
         .navigationTitle("Sleep")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button { showCreateSheet = true } label: {
+                    Image(systemName: "plus.circle").font(.system(size: 16))
+                }
+                .foregroundStyle(.indigo)
+            }
+        }
         .task { await loadNeedData() }
         .onChange(of: sync.sleepSessions.count) { _ in
             Task { await loadNeedData() }
+        }
+        .sheet(isPresented: $showCreateSheet) {
+            createSleepSheet
+        }
+        .sheet(item: $editingSession) { session in
+            editSleepSheet(session: session)
         }
     }
 
@@ -162,10 +182,27 @@ struct SleepView: View {
             sleepRing(pct: pct, color: color)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Last Night")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.55))
-                    .kerning(1.6)
+                HStack(spacing: 6) {
+                    Text("Last Night")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .kerning(1.6)
+                    Button {
+                        editStart = session.start
+                        editEnd = session.end
+                        editingSession = session
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.white.opacity(0.35))
+                    }
+                    .buttonStyle(.plain)
+                    if session.source == "manual" {
+                        Text("✎")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.indigo.opacity(0.6))
+                    }
+                }
                 Text(durationText(durSec))
                     .font(.system(size: 28, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
@@ -226,7 +263,7 @@ struct SleepView: View {
         let wakeSec = session.briefWakeTotalSeconds
         let asleepSec = max(0, durSec - wakeSec)
         let eff = durSec > 0 ? Int(Double(asleepSec) / Double(durSec) * 100) : 0
-        let stages = session.stages ?? []
+        let stages = paddedStages(session)
 
         return VStack(spacing: 12) {
             HStack(spacing: 0) {
@@ -299,6 +336,27 @@ struct SleepView: View {
         }
     }
 
+    /// Stages array with leading/trailing gaps filled as `.core` so the bar/legend
+    /// reflect the full session window — including hours added by manual edits
+    /// that the original detector didn't see.
+    private func paddedStages(_ session: SleepSession) -> [SleepStageSegment] {
+        let raw = (session.stages ?? []).sorted { $0.start < $1.start }
+        guard let first = raw.first, let last = raw.last else {
+            // No detected stages — synthesize one Core block spanning whole session.
+            guard session.end > session.start else { return [] }
+            return [SleepStageSegment(start: session.start, end: session.end, stage: .core)]
+        }
+        var out: [SleepStageSegment] = []
+        if first.start > session.start {
+            out.append(SleepStageSegment(start: session.start, end: first.start, stage: .core))
+        }
+        out.append(contentsOf: raw)
+        if last.end < session.end {
+            out.append(SleepStageSegment(start: last.end, end: session.end, stage: .core))
+        }
+        return out
+    }
+
     private func stageTotals(_ stages: [SleepStageSegment]) -> [SleepStage: Int] {
         var out: [SleepStage: Int] = [:]
         for s in stages {
@@ -343,9 +401,16 @@ struct SleepView: View {
                 Text(session.start.formatted(date: .abbreviated, time: .omitted))
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white)
-                Text(timeRangeText(session))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.55))
+                HStack(spacing: 4) {
+                    Text(timeRangeText(session))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.55))
+                    if session.source == "manual" {
+                        Text("✎")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.indigo.opacity(0.6))
+                    }
+                }
             }
 
             Spacer()
@@ -360,6 +425,18 @@ struct SleepView: View {
                         .foregroundStyle(.white.opacity(0.45))
                 }
             }
+
+            Button {
+                editStart = session.start
+                editEnd = session.end
+                editingSession = session
+            } label: {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.white.opacity(0.4))
+            }
+            .buttonStyle(.plain)
+            .padding(.leading, 4)
         }
         .padding(.vertical, 4)
     }
@@ -419,5 +496,117 @@ struct SleepView: View {
             if let n = m.sleepNeedMinutes { dict[m.date] = n }
         }
         needByDate = dict
+    }
+
+    // MARK: - Create sheet
+
+    private var createSleepSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Bedtime") {
+                    DatePicker("Sleep start", selection: $createStart, displayedComponents: [.date, .hourAndMinute])
+                }
+                Section("Wake time") {
+                    DatePicker("Sleep end", selection: $createEnd, displayedComponents: [.date, .hourAndMinute])
+                }
+                Section {
+                    Button("Classify & Save") {
+                        Task { await commitCreateSession() }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.indigo)
+                }
+            }
+            .navigationTitle("New Sleep Session")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showCreateSheet = false }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+
+    @MainActor
+    private func commitCreateSession() async {
+        let classified = await sync.classifyWindow(rawStore: ble.rawDataStore, start: createStart, end: createEnd)
+        let session = SleepSession(
+            start: createStart,
+            end: createEnd,
+            stages: classified?.stages,
+            briefWakeCount: classified?.briefWakeCount ?? 0,
+            briefWakeTotalSeconds: classified?.briefWakeTotalSeconds ?? 0,
+            source: "manual"
+        )
+        sync.addSleepSession(session)
+        // Enqueue recompute so recovery/strain/sleep scores update
+        let cal = Calendar.current
+        var dates: [Date] = []
+        var d = cal.startOfDay(for: createStart)
+        while d <= createEnd {
+            dates.append(d)
+            guard let n = cal.date(byAdding: .day, value: 1, to: d) else { break }
+            d = n
+        }
+        await ble.recomputeQueue.enqueue(dates: dates, rawStore: ble.rawDataStore, dailyStore: ble.dailyMetrics) { [weak ble] in
+            guard let ble else { return }
+            Task { @MainActor in await ble.refreshRecoveryFromStore() }
+        }
+        showCreateSheet = false
+    }
+
+    // MARK: - Edit sheet
+
+    private func editSleepSheet(session: SleepSession) -> some View {
+        NavigationStack {
+            Form {
+                Section("Bedtime") {
+                    DatePicker("Sleep start", selection: $editStart, displayedComponents: [.date, .hourAndMinute])
+                }
+                Section("Wake time") {
+                    DatePicker("Sleep end", selection: $editEnd, displayedComponents: [.date, .hourAndMinute])
+                }
+                Section {
+                    Button("Reclassify & Save") {
+                        Task { await commitEditSession(original: session) }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.indigo)
+
+                    Button("Delete Session", role: .destructive) {
+                        sync.deleteSleepSession(id: session.id)
+                        editingSession = nil
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .navigationTitle("Edit Sleep")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { editingSession = nil }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+
+    @MainActor
+    private func commitEditSession(original: SleepSession) async {
+        let classified = await sync.classifyWindow(rawStore: ble.rawDataStore, start: editStart, end: editEnd)
+        let session = SleepSession(
+            start: editStart,
+            end: editEnd,
+            stages: classified?.stages,
+            briefWakeCount: classified?.briefWakeCount ?? 0,
+            briefWakeTotalSeconds: classified?.briefWakeTotalSeconds ?? 0,
+            id: original.id,
+            source: "manual"
+        )
+        sync.updateSleepSession(session)
+        editingSession = nil
     }
 }

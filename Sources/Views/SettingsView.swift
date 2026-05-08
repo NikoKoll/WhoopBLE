@@ -18,6 +18,8 @@ struct SettingsView: View {
     @State private var showClearConfirm = false
     @State private var redetectStatus: String? = nil
     @State private var redetectRunning = false
+    @State private var recomputeStatus: String? = nil
+    @State private var recomputeRunning = false
     @AppStorage("userWeightKg") private var userWeightKg: Double = 78
     @AppStorage("userAge")      private var userAge: Int        = 35
 
@@ -108,6 +110,26 @@ struct SettingsView: View {
                 }
                 .disabled(redetectRunning)
                 if let s = redetectStatus {
+                    Text(s).font(.caption).foregroundStyle(.secondary)
+                }
+
+                Button {
+                    recomputeRunning = true
+                    recomputeStatus = nil
+                    Task {
+                        await ble.forceRecomputeAll()
+                        recomputeStatus = "Recompute complete"
+                        recomputeRunning = false
+                    }
+                } label: {
+                    HStack {
+                        Text(recomputeRunning ? "Recomputing…" : "Recompute Recovery / Strain / HRV")
+                        Spacer()
+                        if recomputeRunning { ProgressView().scaleEffect(0.7) }
+                    }
+                }
+                .disabled(recomputeRunning)
+                if let s = recomputeStatus {
                     Text(s).font(.caption).foregroundStyle(.secondary)
                 }
 

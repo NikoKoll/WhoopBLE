@@ -107,6 +107,11 @@ final class BLEManager: NSObject, ObservableObject {
     // ISO date (YYYY-MM-DD UTC) of the row backing `recoveryScore`. nil when no score yet.
     // Dashboard uses this to flag "as of <date>" when score is older than today.
     @Published var recoveryDateKey: String? = nil
+    // Recovery breakdown with component scores (circadian-aware).
+    @Published var recoveryBreakdown: RecoveryBreakdown? = nil
+    @Published var recoveryConfidence: Double? = nil
+    @Published var recoveryCircadianPenalty: Double? = nil
+    @Published var recoverySleepType: SleepEpisodeType? = nil
     // Daily strain (0–21), sleep duration (minutes), and sleep need (minutes) from DailyMetricsStore.
     @Published var todayStrain: Double? = nil
     @Published var todaySleepMinutes: Int? = nil
@@ -121,6 +126,8 @@ final class BLEManager: NSObject, ObservableObject {
 
     // Live step count from CMPedometer — today's total, refreshed in real time.
     @Published var dailySteps: Int = 0
+    // Most recent sleep session from SyncManager. Mirrors what SleepView shows as "Last Night".
+    @Published var lastSleepSession: SleepSession? = nil
     private let pedometer = CMPedometer()
 
     // nonisolated(unsafe): constant let, safe to read from any thread/Task.
@@ -159,6 +166,9 @@ final class BLEManager: NSObject, ObservableObject {
         liveSleep.onSessionEnd = { [weak self] session in
             Task { @MainActor [weak self] in self?.syncManager.addSleepSession(session) }
         }
+        syncManager.$sleepSessions
+            .map { $0.sorted { $0.start > $1.start }.first }
+            .assign(to: &$lastSleepSession)
         startPedometer()
         // RestoreIdentifierKey enables iOS to relaunch the app after killing it under memory
         // pressure — the system calls centralManager(_:willRestoreState:) on relaunch so we
@@ -238,6 +248,34 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    /// Force-recompute every stored day plus the last 14 calendar days.
+    /// Bypasses version-mismatch gating — use when algorithm changes haven't
+    /// triggered a backfill (e.g., user re-installed mid-update or wants to
+    /// force-refresh after tweaking inputs).
+    func forceRecomputeAll() async {
+        let stored = await dailyMetrics.loadAll().map(\.date)
+        var utcCal = Calendar(identifier: .gregorian)
+        utcCal.timeZone = TimeZone(identifier: "UTC")!
+        let today = utcCal.startOfDay(for: Date())
+        var keys = Set(stored)
+        for offset in 0...14 {
+            if let d = utcCal.date(byAdding: .day, value: -offset, to: today) {
+                let c = utcCal.dateComponents([.year, .month, .day], from: d)
+                keys.insert(String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!))
+            }
+        }
+        let dates = keys.compactMap { parseISODateString($0) }
+        // Wipe stale rows first — bio-day key convention may have changed,
+        // leaving orphan rows under old keys that no recompute will overwrite.
+        await dailyMetrics.deleteAll()
+        print("[BLEManager] forceRecomputeAll → \(dates.count) day(s) after wipe")
+        await recomputeQueue.configure(healthKit: healthKit)
+        await recomputeQueue.enqueue(dates: dates, rawStore: rawDataStore, dailyStore: dailyMetrics) {
+            [weak self] in
+            await self?.refreshRecoveryFromStore()
+        }
+    }
+
     /// Refresh HealthKit capability flags and run one-time workout migration.
     func refreshCapabilities() async {
         async let resp  = healthKit.hasRecentSamples(HKQuantityType(.respiratoryRate))
@@ -265,9 +303,25 @@ final class BLEManager: NSObject, ObservableObject {
         let sorted = all.sorted { $0.date > $1.date }
 
         // Recovery: fall back across days (morning lock-in may lag by a day).
-        let scoreRow = sorted.first(where: { $0.recoveryScore != nil })
+        let scoreRowRaw = sorted.first(where: { $0.recoveryScore != nil })
+        // Cap displayed score age at 3 days. Older than that → no current
+        // recovery, show nothing rather than mislead with stale week-old value.
+        var utcCalForAge = Calendar(identifier: .gregorian)
+        utcCalForAge.timeZone = TimeZone(identifier: "UTC")!
+        let todayStart = utcCalForAge.startOfDay(for: Date())
+        let scoreRow: DailyMetricsStore.DailyMetrics?
+        if let row = scoreRowRaw, let rowDate = parseISODateString(row.date) {
+            let ageDays = utcCalForAge.dateComponents([.day], from: rowDate, to: todayStart).day ?? 99
+            scoreRow = ageDays <= 3 ? row : nil
+        } else {
+            scoreRow = scoreRowRaw
+        }
         let score    = scoreRow?.recoveryScore
         let scoreKey = scoreRow?.date
+        let breakdown = scoreRow?.recoveryComponents
+        let confidence = scoreRow?.recoveryConfidence
+        let circadianPenalty = scoreRow?.circadianPenalty
+        let sleepType = scoreRow?.sleepTypeCode.map { SleepEpisodeType(rawValue: $0) ?? nil } ?? nil
 
         // Strain + sleep: only current or previous calendar day — stale days are misleading.
         var utcCal = Calendar(identifier: .gregorian)
@@ -286,11 +340,15 @@ final class BLEManager: NSObject, ObservableObject {
         let sleepNeed = recent.first(where: { $0.sleepNeedMinutes != nil })?.sleepNeedMinutes
 
         await MainActor.run {
-            self.recoveryScore         = score
-            self.recoveryDateKey       = scoreKey
-            self.todayStrain           = strain
-            self.todaySleepMinutes     = sleepMin
-            self.todaySleepNeedMinutes = sleepNeed
+            self.recoveryScore             = score
+            self.recoveryDateKey           = scoreKey
+            self.recoveryBreakdown         = breakdown
+            self.recoveryConfidence        = confidence
+            self.recoveryCircadianPenalty  = circadianPenalty
+            self.recoverySleepType         = sleepType
+            self.todayStrain               = strain
+            self.todaySleepMinutes         = sleepMin
+            self.todaySleepNeedMinutes     = sleepNeed
         }
     }
 
@@ -317,10 +375,11 @@ final class BLEManager: NSObject, ObservableObject {
 
         for offset in 0...daysBack {
             guard let dayStart = cal.date(byAdding: .day, value: -offset, to: today) else { continue }
-            let dayEnd     = cal.date(byAdding: .day,  value:  1, to: dayStart) ?? dayStart
+            let nextDay    = cal.date(byAdding: .day,  value:  1, to: dayStart) ?? dayStart
             let prevDay    = cal.date(byAdding: .day,  value: -1, to: dayStart) ?? dayStart
-            let nightStart = cal.date(byAdding: .hour, value: 18, to: prevDay)  ?? prevDay
-            let nightEnd   = cal.date(byAdding: .hour, value: 12, to: dayStart) ?? dayStart
+            // Wider window: [prevDay 12:00, nextDay 12:00] catches post-midnight + morning sleep
+            let nightStart = cal.date(byAdding: .hour, value: 12, to: prevDay) ?? prevDay
+            let nightEnd   = cal.date(byAdding: .hour, value: 12, to: nextDay) ?? nextDay
 
             await rawDataStore.flush()
             let hrToday = await rawDataStore.loadHR(for: dayStart)
@@ -343,9 +402,15 @@ final class BLEManager: NSObject, ObservableObject {
             let raw = SleepDetector().process(historical)
 
             let detected = raw
-                .filter { $0.end >= dayStart && $0.end < dayEnd }
+                .filter { $0.end <= nextDay }
                 .filter { $0.end.timeIntervalSince($0.start) >= 1800 }
                 .filter { $0.end.timeIntervalSince($0.start) <= 14 * 3600 }
+                // Filter afternoon couch sessions that SleepDetector may misclassify as sleep
+                .filter { s in
+                    let mid = s.start.addingTimeInterval(s.end.timeIntervalSince(s.start) / 2)
+                    let midHour = Calendar.current.component(.hour, from: mid)
+                    return !(midHour >= 13 && midHour < 18 && s.end.timeIntervalSince(s.start) < 10800)
+                }
 
             for s in detected {
                 let dup = syncManager.sleepSessions.contains {

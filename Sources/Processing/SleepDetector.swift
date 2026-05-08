@@ -39,8 +39,8 @@ final class SleepDetector {
         // ~63, making sitting qualify as "asleep" (avg < min+5). globalP5 ≈ true RHR (~52),
         // so floored baseline forces real sleep gate to be HR ≤ globalP5 + 5.
         let allHR = sorted.map { Double($0.heartRate) }.sorted()
-        let globalP5  = allHR[max(0, Int(Double(allHR.count) * 0.05) - 1)]
-        let globalP10 = allHR[max(0, Int(Double(allHR.count) * 0.10) - 1)]
+        let globalP5  = allHR[max(0, Int(Double(allHR.count) * 0.05))]
+        let globalP10 = allHR[max(0, Int(Double(allHR.count) * 0.10))]
         print("[SleepDetector] globalP5=\(Int(globalP5)) globalP10=\(Int(globalP10)) min=\(Int(allHR.first ?? 0)) max=\(Int(allHR.last ?? 0)) n=\(allHR.count)")
 
         let windows = buildWindows(from: sorted)
@@ -58,7 +58,7 @@ final class SleepDetector {
                              .sorted()
             let localP10: Double
             if pool.count >= 12 {
-                localP10 = pool[max(0, Int(Double(pool.count) * 0.10) - 1)]
+                localP10 = pool[max(0, Int(Double(pool.count) * 0.10))]
             } else {
                 localP10 = globalP10
             }
@@ -185,15 +185,27 @@ final class SleepDetector {
     }
 
     private func buildSession(windows: [Window], stages: [SleepStage], from s: Int, to e: Int) -> SleepSession? {
-        // Trim session boundaries to first/last DEEP-stage window. REM rarely fires on
-        // historical 0xa1 data (sparse RR), so DEEP is the only reliable "definitely asleep"
-        // marker. Pre-bed sitting and post-wake couch time get classified as CORE because HR
-        // is just above sleep baseline — trimming kills those tails. If no DEEP exists in
-        // the window, the period probably wasn't real sleep at all → drop it.
-        let deepIndices = (s...e).filter { stages[$0] == .deep }
-        guard let trimS = deepIndices.first, let trimE = deepIndices.last else {
-            print("[SleepDetector] dropped raw session \(windows[s].start) → \(windows[e].end) — no DEEP segment")
-            return nil
+        // Trim session boundaries to first/last DEEP-stage window when DEEP exists.
+        // CORE often includes quiet sitting (misclassified by HR-only detector) — trimming
+        // to DEEP-only boundaries excludes those tails. When no DEEP is found, fall back
+        // to non-AWAKE boundaries so borderline sessions aren't silently dropped.
+        let sleepIndices = (s...e).filter { stages[$0] == .deep }
+        let trimS: Int
+        let trimE: Int
+        var briefWakeOnlyFromGap = false
+        if let first = sleepIndices.first, let last = sleepIndices.last {
+            trimS = first; trimE = last
+        } else {
+            // No DEEP — use non-AWAKE boundaries as best guess.
+            let awakeSet = Set((s...e).filter { stages[$0] == .awake })
+            let nonAwake = (s...e).filter { !awakeSet.contains($0) }
+            guard let fs = nonAwake.first, let fe = nonAwake.last else {
+                print("[SleepDetector] dropped raw session \(windows[s].start) → \(windows[e].end) — all windows AWAKE")
+                return nil
+            }
+            trimS = fs; trimE = fe
+            briefWakeOnlyFromGap = true
+            print("[SleepDetector] no DEEP in session \(windows[s].start) — using non-AWAKE boundaries")
         }
 
         let segments = (trimS...trimE).map {
@@ -246,5 +258,62 @@ final class SleepDetector {
         }
         out.append(cur)
         return out
+    }
+
+    // MARK: - Full-window classification (no session trimming)
+
+    /// Classifies every 5-min window within [windowStart, windowEnd] without
+    /// extracting/detecting contiguous sessions or trimming to deep-stage boundaries.
+    /// Returns stage segments covering the full user-specified range.
+    func classifyFullWindow(_ samples: [HistoricalSample], windowStart: Date, windowEnd: Date) -> [SleepStageSegment] {
+        let sorted = samples.sorted { $0.timestamp < $1.timestamp }
+        guard sorted.count >= 4 else { return [] }
+
+        // Global p5 anchors baseline floor
+        let allHR = sorted.map { Double($0.heartRate) }.sorted()
+        let globalP5  = allHR[max(0, Int(Double(allHR.count) * 0.05))]
+        let globalP10 = allHR[max(0, Int(Double(allHR.count) * 0.10))]
+
+        // Build windows from user bounds
+        var windows: [Window] = []
+        var ws = windowStart
+        while ws < windowEnd {
+            let we = min(ws.addingTimeInterval(windowSize), windowEnd)
+            let bucket = sorted.filter { $0.timestamp >= ws && $0.timestamp < we }
+            if !bucket.isEmpty { windows.append(Window(start: ws, end: we, samples: bucket)) }
+            ws = we
+        }
+        guard !windows.isEmpty else { return [] }
+
+        let features = windows.map { self.feature(for: $0) }
+
+        // Rolling baseline per window (trailing 60 min p10, floored to globalP5)
+        let baselines = windows.indices.map { i -> Double in
+            let cutoff = windows[i].end.addingTimeInterval(-baselineWindow)
+            let pool = sorted.filter { $0.timestamp >= cutoff && $0.timestamp < windows[i].end }
+                .map { Double($0.heartRate) }.sorted()
+            let localP10: Double
+            if pool.count >= 12 {
+                localP10 = pool[max(0, Int(Double(pool.count) * 0.10))]
+            } else {
+                localP10 = globalP10
+            }
+            return max(localP10, globalP5)
+        }
+
+        // Build merged stage segments
+        var segments: [SleepStageSegment] = []
+        for i in windows.indices {
+            let stage = self.classify(feature: features[i], baseline: baselines[i])
+            let seg = SleepStageSegment(start: windows[i].start, end: windows[i].end, stage: stage)
+            // Coalesce adjacent same-stage segments
+            if var last = segments.last, last.stage == seg.stage, last.end == seg.start {
+                segments.removeLast()
+                segments.append(SleepStageSegment(start: last.start, end: seg.end, stage: seg.stage))
+            } else {
+                segments.append(seg)
+            }
+        }
+        return segments
     }
 }

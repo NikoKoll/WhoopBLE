@@ -541,6 +541,148 @@ final class SyncManager: ObservableObject {
         print("[SyncManager] live sleep session added: \(session.start.formatted(date: .abbreviated, time: .shortened)) → \(session.end.formatted(date: .omitted, time: .shortened))")
     }
 
+    // MARK: - Session mutation
+
+    /// Replace a session by id (used for manual edits). Removes old HK sample + writes new.
+    /// Enqueues recompute for all affected dates so recovery/strain/sleep scores refresh.
+    func updateSleepSession(_ session: SleepSession) {
+        guard let idx = sleepSessions.firstIndex(where: { $0.id == session.id }) else {
+            print("[SyncManager] updateSleepSession: session \(session.id) not found")
+            return
+        }
+        let old = sleepSessions[idx]
+        // Recompute brief-wake count + total seconds from the (clipped) stages
+        // so the persisted session reflects the new bounds. Otherwise an 8h
+        // session shrunk to 4h still reports the original wake count.
+        let clipped = Self.clippedSession(session)
+        sleepSessions[idx] = clipped
+        sleepSessions.sort { $0.start < $1.start }
+        saveSleepSessions()
+        let hk = bleManager?.healthKit
+        hk?.deleteSleepSamples(from: old.start, to: old.end)
+        hk?.writeSleep([clipped])
+
+        let affected = Set(affectedDateKeys(for: old) + affectedDateKeys(for: clipped))
+            .compactMap { parseISODateString($0) }
+        if !affected.isEmpty, let ble = bleManager {
+            Task {
+                await ble.recomputeQueue.enqueue(dates: affected, rawStore: ble.rawDataStore, dailyStore: ble.dailyMetrics) { [weak ble] in
+                    guard let ble else { return }
+                    Task { @MainActor in await ble.refreshRecoveryFromStore() }
+                }
+            }
+        }
+        print("[SyncManager] updated sleep session \(session.id) (\(old.start)→\(old.end)) ⇒ (\(session.start)→\(session.end))")
+    }
+
+    /// Remove a session by id. Removes HK samples + enqueues recompute.
+    func deleteSleepSession(id: String) {
+        guard let idx = sleepSessions.firstIndex(where: { $0.id == id }) else { return }
+        let session = sleepSessions[idx]
+        sleepSessions.remove(at: idx)
+        saveSleepSessions()
+        bleManager?.healthKit.deleteSleepSamples(from: session.start, to: session.end)
+        let affected = Set(affectedDateKeys(for: session)).compactMap { parseISODateString($0) }
+        if !affected.isEmpty, let ble = bleManager {
+            Task {
+                await ble.recomputeQueue.enqueue(dates: affected, rawStore: ble.rawDataStore, dailyStore: ble.dailyMetrics) { [weak ble] in
+                    guard let ble else { return }
+                    Task { @MainActor in await ble.refreshRecoveryFromStore() }
+                }
+            }
+        }
+        print("[SyncManager] deleted sleep session \(id)")
+    }
+
+    /// Classify HR+RR from RawDataStore within a time window into a SleepSession.
+    /// Returns a session with the user's **full** start-end boundaries, with stages
+    /// classified for every 5-min window within that range (no deep-only trimming).
+    func classifyWindow(rawStore: RawDataStore, start: Date, end: Date) async -> SleepSession? {
+        let cal = Calendar.current
+        let startDay = cal.startOfDay(for: start)
+        let endDay = cal.startOfDay(for: end)
+        var allHR: [RawDataStore.HRSample] = []
+        var allRR: [RawDataStore.RRSample] = []
+        var d = startDay
+        while d <= endDay {
+            allHR += await rawStore.loadHR(for: d)
+            allRR += await rawStore.loadRR(for: d)
+            guard let n = cal.date(byAdding: .day, value: 1, to: d) else { break }
+            d = n
+        }
+        let startTs = Int(start.timeIntervalSince1970)
+        let endTs = Int(end.timeIntervalSince1970)
+        let windowHR = allHR.filter { $0.timestamp >= startTs && $0.timestamp <= endTs }
+        guard windowHR.count >= 4 else {
+            print("[SyncManager] classifyWindow: insufficient HR samples (\(windowHR.count))")
+            return nil
+        }
+        let samples: [HistoricalSample] = windowHR.map { hr in
+            let rrs = allRR.filter { $0.timestamp == hr.timestamp }
+            return HistoricalSample(
+                timestamp: Date(timeIntervalSince1970: Double(hr.timestamp)),
+                heartRate: hr.bpm,
+                rrIntervals: rrs.isEmpty ? nil : rrs.map { Double($0.intervalMs) / 1000.0 }
+            )
+        }.sorted { $0.timestamp < $1.timestamp }
+
+        let detector = SleepDetector()
+        let segments = detector.classifyFullWindow(samples, windowStart: start, windowEnd: end)
+
+        let awakeCount = segments.filter { $0.stage == .awake }.count
+        let awakeSecs = segments.filter { $0.stage == .awake }
+            .reduce(0) { $0 + Int($1.end.timeIntervalSince($1.start)) }
+
+        return SleepSession(
+            start: start,
+            end: end,
+            stages: segments.isEmpty ? nil : segments,
+            briefWakeCount: awakeCount,
+            briefWakeTotalSeconds: awakeSecs,
+            source: "manual"
+        )
+    }
+
+    /// Rebuild brief-wake count + seconds from session.stages clipped to
+    /// session.start..session.end. Avoids stale wake counts after manual edits.
+    static func clippedSession(_ s: SleepSession) -> SleepSession {
+        guard let stages = s.stages else { return s }
+        var wakeCount = 0
+        var wakeSecs = 0
+        for seg in stages {
+            let segStart = max(seg.start, s.start)
+            let segEnd = min(seg.end, s.end)
+            guard segEnd > segStart else { continue }
+            if seg.stage == .awake {
+                wakeCount += 1
+                wakeSecs += Int(segEnd.timeIntervalSince(segStart))
+            }
+        }
+        return SleepSession(
+            start: s.start, end: s.end,
+            stages: stages,
+            briefWakeCount: wakeCount, briefWakeTotalSeconds: wakeSecs,
+            id: s.id, source: s.source
+        )
+    }
+
+    private func affectedDateKeys(for session: SleepSession, includePrevDay: Bool = true) -> [String] {
+        let cal = Calendar.current
+        var keys: [String] = []
+        var d = cal.startOfDay(for: session.start)
+        while d <= session.end {
+            keys.append(isoDateKey(d))
+            guard let n = cal.date(byAdding: .day, value: 1, to: d) else { break }
+            d = n
+        }
+        // Include previous day for overnight sessions (biological day uses noon cutoff).
+        // A session ending at 8 AM belongs to the previous biological day.
+        if includePrevDay, let prev = cal.date(byAdding: .day, value: -1, to: cal.startOfDay(for: session.start)) {
+            keys.append(isoDateKey(prev))
+        }
+        return keys
+    }
+
     private func loadSleepSessions() {
         guard let data = UserDefaults.standard.data(forKey: sleepKey),
               let sessions = try? JSONDecoder().decode([SleepSession].self, from: data) else { return }
@@ -584,6 +726,14 @@ final class SyncManager: ObservableObject {
         UserDefaults.standard.removeObject(forKey: processedKey)
         processedBatches = []
         syncedBatchCount = 0
+        // Wipe DailyMetrics too — otherwise stale recovery/sleep rows linger
+        // until next recompute, surfacing on dashboard as if data still existed.
+        if let ble = bleManager {
+            Task {
+                await ble.dailyMetrics.deleteAll()
+                await MainActor.run { ble.recoveryScore = nil; ble.recoveryDateKey = nil }
+            }
+        }
         print("[SyncManager] sleep + batch cache cleared — will re-sync on next connect")
     }
 
@@ -638,6 +788,7 @@ final class SyncManager: ObservableObject {
         var dateKeys: Set<String> = [isoDateKey(Date())]
         for s in accumulatedSamples { dateKeys.insert(isoDateKey(s.timestamp)) }
 
+        let capturedSamples: [HistoricalSample]
         if !accumulatedSamples.isEmpty {
             let sorted = accumulatedSamples.sorted { $0.timestamp < $1.timestamp }
 
@@ -690,10 +841,14 @@ final class SyncManager: ObservableObject {
             } else {
                 print("[SyncManager] sleep detection: no new sessions from \(sorted.count) samples")
             }
+            capturedSamples = accumulatedSamples
             accumulatedSamples = []
-        } else if SyncManager.debugLogging {
-            print("[Sync Summary]   Total samples    : 0 (no accumulated samples)")
-            print("[Sync Summary] ──────────────────────────────────────")
+        } else {
+            capturedSamples = []
+            if SyncManager.debugLogging {
+                print("[Sync Summary]   Total samples    : 0 (no accumulated samples)")
+                print("[Sync Summary] ──────────────────────────────────────")
+            }
         }
 
         // Flush pendingBatchHR + RR from accumulated samples atomically before enqueue.
@@ -701,7 +856,7 @@ final class SyncManager: ObservableObject {
             let dates = dateKeys.compactMap { parseISODateString($0) }
             let batchHR = pendingBatchHR
             pendingBatchHR = []
-            let batchRR: [(timestamp: Int, intervalMs: Int)] = accumulatedSamples.flatMap { s in
+            let batchRR: [(timestamp: Int, intervalMs: Int)] = capturedSamples.flatMap { s in
                 (s.rrIntervals ?? []).map { rr in
                     (timestamp: Int(s.timestamp.timeIntervalSince1970),
                      intervalMs: Int(rr * 1000))

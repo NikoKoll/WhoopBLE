@@ -1,141 +1,139 @@
-  Summary of changes:
+# Session Handoff — 2026-05-08
 
-  - HealthKitWriter: added activeEnergyBurned + appleExerciseTime to HK share permissions;
-  added writeActiveEnergy(kcal:start:end:) and writeExerciseTime(minutes:start:end:)
-  - BLEManager: MET-zone table (maxHR=185, 70kg default); accumulateActivity() called per
-  HR sample; flushes every 3 min with no double-counting; accumulators reset on disconnect
+## Recap
+Big session focused on recovery + sleep correctness. ~12 distinct bugs/issues fixed across detector, classifier, recovery score, baselines, persistence, surfacing layer.
 
-  Assumptions: weight=70kg, maxHR=185. Exercise threshold = HR ≥ 60% = ≥111 BPM.
+## Changes shipped
 
-  Expected behavior: connect strap → every 3 min you'll see [HK] Energy written: X kcal in
-  logs. After some time Health app → Browse → Activity → Active Energy will show entries.
-  If HR stayed ≥ 111 BPM, Exercise ring minutes will accumulate too.
+### Recovery score (EnhancedRecoveryScore + DayRecomputer)
+| # | Change | Files |
+|---|---|---|
+| 1 | Quantity formula caps at 100 when need met (was 67 due to `/1.5` divisor) | EnhancedRecoveryScore.swift |
+| 2 | Stage pct clamp to 0...1 with guard | EnhancedRecoveryScore.swift |
+| 3 | Autonomic intent comment (HRV+, RHR-, strain-) | EnhancedRecoveryScore.swift |
+| 4 | Confidence formula now includes strain availability (0.30/0.30/0.20/0.20) | EnhancedRecoveryScore.swift |
+| 5 | `popStrain` constant added | EnhancedRecoveryScore.swift |
+| 6 | Recovery score = nil when confidence < 0.5 (gate) | DayRecomputer.swift |
+| 7 | Per-bio-day HRV from RR within session window (not calendar date) | DayRecomputer.swift |
+| 8 | Per-bio-day RHR from HR over bio-day window | DayRecomputer.swift |
+| 9 | HK SDNN fallback removed for HRV (unit mismatch with WHOOP RMSSD) | DayRecomputer.swift |
+| 10 | HR-coverage gate uses minute-buckets ≥360min (was naive count/86400) | DayRecomputer.swift |
+| 11 | RR outlier filter: `mean > 1.0` divide guard | DayRecomputer.swift |
+| 12 | `computeHRV` requires ≥5 valid pair diffs | DayRecomputer.swift |
+| 13 | `relevantKeys` filter restored: each calendar recompute writes only ±1 day bio rows | DayRecomputer.swift |
 
-✻ Brewed for 3m 9s
+### Baselines (DailyMetricsStore + DayRecomputer)
+| # | Change | Files |
+|---|---|---|
+| 14 | Sample variance n-1 (was n) | DailyMetricsStore.swift |
+| 15 | UTC-consistent baseline cutoff (was Calendar.current) | DailyMetricsStore.swift |
+| 16 | `rollingBaseline` returns count for shrinkage | DailyMetricsStore.swift |
+| 17 | `blendBaseline` warmup=7 — personal blends toward population during ramp-up | DayRecomputer.swift |
+| 18 | `deleteAll()` API added | DailyMetricsStore.swift |
 
-❯ make a handoff of this session changes and possible fixes
+### Sleep pipeline (SleepDetector + BiologicalDay + DayRecomputer)
+| # | Change | Files |
+|---|---|---|
+| 19 | SleepDetector brace mismatch fix (build error) | SleepDetector.swift |
+| 20 | Afternoon-nap blanket filter removed; classifier handles via `.nap` type | DayRecomputer.swift |
+| 21 | Detected vs stored session dedup (overlap check) | DayRecomputer.swift |
+| 22 | Bio day = wake calendar date (UTC) — dropped noon-shift convention | BiologicalDay.swift |
+| 23 | `biologicalDayKey(for:)` exposed for SleepView | BiologicalDay.swift |
 
-  Read 1 file, recalled 1 memory, wrote 2 memories (ctrl+o to expand)
+### Surfacing + edits (BLEManager + SyncManager + Settings)
+| # | Change | Files |
+|---|---|---|
+| 24 | Stale recovery age cap: scores >3 days old not displayed as current | BLEManager.swift |
+| 25 | `updateSleepSession` rebuilds `briefWakeCount` + seconds from clipped stages | SyncManager.swift |
+| 26 | `clearAllSleepData` also wipes DailyMetrics + clears displayed recovery | SyncManager.swift |
+| 27 | `forceRecomputeAll()` API + Settings button | BLEManager.swift, SettingsView.swift |
+| 28 | `forceRecomputeAll` wipes DailyMetrics first (orphan-row migration) | BLEManager.swift |
+| 29 | HealthKit sleep clock-skew tightened 1h → 5min | HealthKitWriter.swift |
 
-⏺ Handoff saved to memory. Summary:
+### SleepView
+| # | Change | Files |
+|---|---|---|
+| 30 | Stage bar pads detected stages with Core to fill edited duration | SleepView.swift |
 
-  ---
-  Session Changes (7 fixes)
+## AlgoVersions
+- `hrv` = 4 (HK SDNN fallback removed)
+- `strain` = 3
+- `sleep` = 11 (filter removed, dedup, bio-day rule change, briefWake recompute)
+- `recovery` = 18 (formula, baseline, gating, per-bio-day, bio-day rule, relevantKeys)
 
-  ┌─────┬─────────────────────────────────────────────────┬────────────────────────────┐
-  │  #  │                      What                       │            File            │
-  ├─────┼─────────────────────────────────────────────────┼────────────────────────────┤
-  │ 1   │ batchID=0 probe — was 1, strap ignored it;      │ SyncManager.swift          │
-  │     │ reverted + added 3-stage retry                  │                            │
-  ├─────┼─────────────────────────────────────────────────┼────────────────────────────┤
-  │     │ onConnected() reset — stale                     │                            │
-  │ 2   │ batchQueue/chunks/samples carried across        │ SyncManager.swift          │
-  │     │ sessions                                        │                            │
-  ├─────┼─────────────────────────────────────────────────┼────────────────────────────┤
-  │     │ Batch timestamp fix — WHOOP internal clock →    │                            │
-  │ 3   │ convert via whoopToUnixOffset, else fallback to │ SyncManager.swift          │
-  │     │  now                                            │                            │
-  ├─────┼─────────────────────────────────────────────────┼────────────────────────────┤
-  │ 4   │ Future sample filter — blocks ts > tomorrow     │ SyncManager.swift          │
-  │     │ from entering accumulation                      │                            │
-  ├─────┼─────────────────────────────────────────────────┼────────────────────────────┤
-  │ 5   │ HealthKit sleep crash — clamp session to 24h    │ HealthKitWriter.swift      │
-  │     │ max, skip future-end sessions                   │                            │
-  ├─────┼─────────────────────────────────────────────────┼────────────────────────────┤
-  │     │ Sleep detector overhaul — global resting HR     │                            │
-  │ 6   │ baseline, wake threshold 10→40 min, margin 5→15 │ SleepDetector.swift        │
-  │     │  BPM, session merging                           │                            │
-  ├─────┼─────────────────────────────────────────────────┼────────────────────────────┤
-  │ 7   │ Activity rings — MET-zone calorie estimation +  │ BLEManager.swift +         │
-  │     │ exercise time, 3-min flush, no double-count     │ HealthKitWriter.swift      │
-  └─────┴─────────────────────────────────────────────────┴────────────────────────────┘
+`checkVersionMismatch()` will auto-backfill on launch. Or Settings → "Recompute Recovery / Strain / HRV".
 
-  Outstanding (next session)
+## Known remaining issues (priorities for next session)
 
-  ┌──────────┬──────────────────────────────────────────────────────────────────────────┐
-  │ Priority │                                  Issue                                   │
-  ├──────────┼──────────────────────────────────────────────────────────────────────────┤
-  │ HIGH     │ Strap delivery cursor can't be reset — lost batches from corrupt session │
-  │          │  unrecoverable                                                           │
-  ├──────────┼──────────────────────────────────────────────────────────────────────────┤
-  │ MEDIUM   │ Historical active energy not written during batch sync (only live        │
-  │          │ accumulates)                                                             │
-  ├──────────┼──────────────────────────────────────────────────────────────────────────┤
-  │ LOW      │ 0xa1 timestamp accuracy if strap sends sparse chunks                     │
-  ├──────────┼──────────────────────────────────────────────────────────────────────────┤
-  │ LOW      │ Sleep detector params need tuning after first real overnight sync        │
+### P0
+- **`Sleep=719min` (12h) on 5/7 logs** — unclear if real (multiple stored sessions for same night) or storage corruption. Inspect `whoopSleepSessions_v1` UserDefaults dump. If duplicates, dedup at storage layer not just at recompute.
+- **`forceRecomputeAll` perf**: serial recompute over 60+ days has no progress UI, no batching, no cancel. Background task may be killed. Add `recomputeProgress` published + RecomputeQueue progress callback + Settings progress label "X/Y days".
 
+### P1
+- **`commitCreateSession` recompute coverage** (SleepView): doesn't call `affectedDateKeys`. Manual session creation may not trigger recompute for previous bio day. Switch to existing `affectedDateKeys` helper or route via `addSleepSession`.
+- **Today date label**: with bio-day=wake-date now, scoreKey should match `todayKey` naturally. Verify on device. Edge case: if user hasn't slept yet today, fallback to yesterday's bio day — show "as of <date>" cleanly.
+- **Live + batch dedup mismatch**: SyncManager:535 uses 5-min start-distance, DayRecomputer uses interval-overlap. Unify.
+- **`clearAllSleepData` triggers Task** holding bleManager weakly — verify recoveryScore resets on main thread after async wipe.
 
+### P2
+- **Nap recovery caps at 50%** — design intent? Document in code or rebalance. User taking only naps maxes at 50% even with perfect HRV.
+- **`computeHRVSleep` is dead code** post per-bio-day refactor. Remove for clarity.
+- **Personalized sleep need uses full-window std** — mean=need, std=history std. Z-score interpretation drifts. Currently quantity uses ratio not z, so doesn't bite. Document.
+- **Strain coverage 360 minutes**: edge case — strap worn only at night (480 min sleep + 0 day) just passes. May want stricter day-only coverage.
 
+### P3 — Architectural debt
+- **BLEManager 1021 LOC** + **SyncManager 935 LOC**: too many responsibilities. Split:
+  - BLE transport (scan/connect/characteristic routing)
+  - Live metrics aggregation (HR/HRV/steps/energy/exercise)
+  - Sync orchestration (already mostly in SyncManager)
+  - HealthKit write coordinator
+- **CircadianEngine state retained across recomputes** in `RecomputeQueue.recomputer` singleton. Works but fragile — clearing recomputer mid-session would reset baseline. Document or persist circadian state to disk.
+- **`whoopSleepSessions_v1` UserDefaults grows unbounded**. Add vacuum: drop sessions >90 days old or move to file storage.
+- **No tests**. Recovery formula + sleep detector are testable pure functions. Wire up XCTest target with synthetic input fixtures.
 
+### P4 — Protocol RE outstanding (per CLAUDE.md)
+- 0xa1 chunk timestamp resolution
+- Strap-side batch delivery cursor reset
+- 0x57 EVENTS HR byte interpretation (currently rejected as out-of-range)
+- 0xff metric1 bytes[8-9] purpose
 
+## Plan: app improvements next session
 
+### Theme A — Performance + UX of recompute
+1. Publish `recomputeProgress: (done: Int, total: Int)?` from BLEManager.
+2. RecomputeQueue gains `progressHandler: (Int, Int) -> Void`.
+3. SettingsView progress label.
+4. Optional cancel button (queue.clear()).
+5. Batch enqueue: process 10 dates, yield, repeat — keeps UI responsive.
 
- Yes — HKWorkout closes the Exercise ring. Any workout written to HealthKit counts
-  exercise minutes toward the ring. Here's the plan:
+### Theme B — Sleep storage hygiene
+1. Inspect 12h sleep total: dump `whoopSleepSessions_v1` to console on launch (debug-only).
+2. Dedup-on-load: when SyncManager loads sessions, drop overlapping pairs (keep newest by id or longest by duration).
+3. Vacuum sessions >90 days.
+4. SleepView: list shows session.id + source — useful for finding stuck duplicates.
 
-  ---
-  Plan
+### Theme C — Dashboard polish
+1. Show recovery confidence next to ring ("75% • conf 0.85").
+2. Show sleep type tag ("Main 8h" / "Nap 0:30" / "Delayed 6h").
+3. "as of" label hides when today; appears with reason when stale.
+4. Manual create/edit session: visible undo + recompute progress.
 
-  What changes
+### Theme D — Tests
+1. XCTest target for `EnhancedRecoveryScore.compute` — fixed-input regressions.
+2. Snapshot test for SleepDetector against canned HR samples.
+3. BiologicalDay grouping tests for boundary cases (midnight/noon-UTC/timezones).
 
-  Backend only — no new UI tab needed. Workouts write silently, same as active energy.
-  Optionally surface workout count in the existing Sleep or Live tab as a small stat.
+### Theme E — Code health
+1. Split BLEManager into transport + aggregator.
+2. Remove dead `computeHRVSleep`.
+3. Persist CircadianEngine state to disk so it survives app relaunch deterministically.
+4. Migrate `whoopSleepSessions_v1` UserDefaults → file in Documents.
 
-  Backend
+## Verification done this session
+- xcodebuild clean after every batch of changes.
+- User pasted live logs showing recovery values + per-bio-day issues, fixed iteratively.
 
-  1. HealthKitWriter — add HKWorkout permission + write function
-  - Add .workoutType() to share set
-  - New writeWorkout(start: Date, end: Date, kcal: Double, activityType:
-  HKWorkoutActivityType)
-  - activityType defaults to .other (can't classify from HR alone)
-  - Include totalEnergyBurned = accumulated kcal for that workout
-
-  2. Workout detection — shared pure function
-  Both live and historical need the same logic. Extract a detectWorkoutBouts(samples:
-  [(Date, Int)]) -> [(start: Date, end: Date, kcal: Double)] helper:
-  - Bout starts: ≥3 consecutive samples with HR ≥ 100 BPM (~54% maxHR, lower than exercise
-  threshold)
-  - Bout ends: HR < 100 BPM for ≥5 min
-  - Minimum bout duration: 10 min (discard noise)
-  - Kcal per bout: MET × 70kg × hours (same formula already in BLEManager)
-
-  3. Live workout detection in BLEManager
-  Simple state machine alongside accumulateActivity():
-  - States: idle / active(start: Date, samples: [(Date,Int)])
-  - On each HR sample: transition based on threshold + time conditions
-  - On bout end: call healthKit.writeWorkout(...) + log [HK] Workout written: Xmin Ykcal
-  - Reset on disconnect
-
-  4. Historical workouts in SyncManager.finalizeBatch
-  After existing writeHistoricalSamples(samples) call:
-  - Run detectWorkoutBouts on batch samples
-  - Call healthKit.writeWorkout(...) for each bout found
-  - Guard: skip if bout timestamps overlap with already-written workouts (need a small
-  writtenWorkoutRanges: [(Date,Date)] set in SyncManager, reset on clearAllSleepData)
-
-  UI (minimal)
-
-  No new tab. In DashboardView or SleepView, optionally show a small "X workouts synced"
-  count sourced from SyncManager.syncedWorkoutCount: Int (new @Published property).
-  Optional — not required for ring closure.
-
-  Files to modify
-
-  ┌──────────────────────────┬─────────────────────────────────────────────────────────┐
-  │           File           │                         Change                          │
-  ├──────────────────────────┼─────────────────────────────────────────────────────────┤
-  │ HealthKitWriter.swift    │ Add .workoutType() to share; add writeWorkout()         │
-  ├──────────────────────────┼─────────────────────────────────────────────────────────┤
-  │ BLEManager.swift         │ Add live workout state machine alongside                │
-  │                          │ accumulateActivity                                      │
-  ├──────────────────────────┼─────────────────────────────────────────────────────────┤
-  │ SyncManager.swift        │ Call detectWorkoutBouts in finalizeBatch; add           │
-  │                          │ writtenWorkoutRanges guard                              │
-  ├──────────────────────────┼─────────────────────────────────────────────────────────┤
-  │ New:                     │ Pure detectWorkoutBouts() function, shared by both      │
-  │ WorkoutDetector.swift    │ callers                                                 │
-  └──────────────────────────┴─────────────────────────────────────────────────────────┘
-
-  ---
-  Want to proceed with implementation?
+## Open questions for user
+- **Confirm 12h sleep on 5/7 was real** (multiple sessions you actually had) **or storage corruption** (need clear+resync).
+- **Per-stage Apple Health sleep writes** (deep/REM/core)? Currently single asleepUnspecified. Behind a settings toggle. Want it?
+- **Bidirectional Apple Health sync** (read AH edits back into WhoopBLE)? Bigger work — needs HK observer + reconciliation. Not requested yet, flag as future feature.
