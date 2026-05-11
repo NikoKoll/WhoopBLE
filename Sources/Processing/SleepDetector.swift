@@ -65,9 +65,10 @@ final class SleepDetector {
             return max(localP10, globalP5)
         }
 
-        let stages = features.indices.map { i -> SleepStage in
+        let rawStages = features.indices.map { i -> SleepStage in
             classify(feature: features[i], baseline: baselines[i])
         }
+        let stages = SleepStageSmoother().smooth(rawStages)
 
         let sessions = extractSessions(windows: windows, stages: stages)
         return mergeSessions(sessions)
@@ -84,7 +85,8 @@ final class SleepDetector {
     private struct Feature {
         let avgHR: Double
         let hrStd: Double
-        let rrCV: Double?     // coefficient of variation across RR intervals (proxy for HRV irregularity)
+        let rrCV: Double?     // coefficient of variation of RR intervals
+        let rmssd: Double?    // ms — high in REM (~40-60ms), low in DEEP (~15-30ms)
     }
 
     private func buildWindows(from samples: [HistoricalSample]) -> [Window] {
@@ -105,8 +107,7 @@ final class SleepDetector {
         let avg: Double = hrs.reduce(0.0, +) / Double(hrs.count)
         var sumSq: Double = 0
         for h in hrs { let d = h - avg; sumSq += d * d }
-        let denom = Double(max(1, hrs.count - 1))
-        let std: Double = sqrt(sumSq / denom)
+        let std: Double = sqrt(sumSq / Double(max(1, hrs.count - 1)))
 
         var rrs: [Double] = []
         for s in w.samples {
@@ -114,22 +115,60 @@ final class SleepDetector {
             for r in arr where r >= 0.3 && r <= 2.0 { rrs.append(r) }
         }
         var rrCV: Double? = nil
+        var rmssd: Double? = nil
         if rrs.count >= 4 {
-            let m: Double = rrs.reduce(0.0, +) / Double(rrs.count)
-            let v: Double = rrs.map { ($0 - m) * ($0 - m) }.reduce(0.0, +) / Double(rrs.count - 1)
+            let m = rrs.reduce(0.0, +) / Double(rrs.count)
+            let v = rrs.map { ($0 - m) * ($0 - m) }.reduce(0.0, +) / Double(rrs.count - 1)
             if m > 0 { rrCV = sqrt(v) / m }
         }
-        return Feature(avgHR: avg, hrStd: std, rrCV: rrCV)
+        if rrs.count >= 2 {
+            let squaredDiffs = zip(rrs, rrs.dropFirst()).map { a, b -> Double in
+                let d = (b - a) * 1000; return d * d
+            }
+            rmssd = sqrt(squaredDiffs.reduce(0.0, +) / Double(squaredDiffs.count))
+        }
+        return Feature(avgHR: avg, hrStd: std, rrCV: rrCV, rmssd: rmssd)
     }
 
     // MARK: - Stage classifier
+    //
+    // HR delta rules (primary signal, always available):
+    //   delta ≤ 3 bpm + hrStd < 3 → candidate DEEP
+    //   delta ≤ 8 bpm              → candidate CORE
+    //   delta 8–15 bpm             → candidate REM or CORE
+    //   delta > 15 bpm             → AWAKE
+    //
+    // RMSSD rules (secondary signal, used when ≥2 RR intervals available in window):
+    //   rmssd > 45ms in CORE/REM zone → upgrade to REM   (autonomic variability of REM)
+    //   rmssd > 50ms in DEEP zone     → downgrade to CORE (genuine DEEP has quiet HRV)
+    //   rmssd < 25ms in REM zone      → downgrade to CORE (low HRV rules out REM)
 
     private func classify(feature f: Feature, baseline: Double) -> SleepStage {
         let delta = f.avgHR - baseline
         if delta > remHRMargin { return .awake }
-        if delta <= deepHRMargin && f.hrStd < deepStdMax { return .deep }
-        if delta <= coreHRMargin { return .core }
-        // Between core and awake: REM if RR variability high, else core (conservative).
+
+        if delta <= deepHRMargin && f.hrStd < deepStdMax {
+            // RMSSD check: genuine DEEP has suppressed HRV. If RMSSD is high, it's likely
+            // quiet wakefulness or light CORE misclassified by HR-only criteria.
+            if let rmssd = f.rmssd, rmssd > 50 { return .core }
+            return .deep
+        }
+
+        if delta <= coreHRMargin {
+            // Upgrade CORE → REM when HRV is elevated (REM hallmark: high autonomic variability).
+            if let rmssd = f.rmssd {
+                return rmssd > 45 ? .rem : .core
+            }
+            if let cv = f.rrCV, cv > 0.08 { return .rem }
+            return .core
+        }
+
+        // delta 8–15 bpm (coreHRMargin < delta ≤ remHRMargin): REM or restless CORE.
+        if let rmssd = f.rmssd {
+            // High HRV in elevated-HR window = REM autonomic switching.
+            // Low HRV = restless/light sleep, not true REM.
+            return rmssd > 35 ? .rem : .core
+        }
         if let cv = f.rrCV, cv > 0.08 { return .rem }
         return .core
     }

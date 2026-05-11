@@ -4,6 +4,7 @@ struct WhoopMetrics: Sendable {
     let timestamp: Date
     let heartRate: Int
     let rrIntervals: [Double]   // seconds
+    var respiratoryRate: Double? = nil  // breaths/min, RSA-derived
 
     var hrv: Double? {
         guard rrIntervals.count >= 2 else { return nil }

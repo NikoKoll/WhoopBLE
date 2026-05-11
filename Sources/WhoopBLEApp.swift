@@ -5,6 +5,10 @@ struct WhoopBLEApp: App {
     @StateObject private var bleManager = BLEManager()
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        BackgroundEngine.shared.register()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -19,6 +23,9 @@ struct WhoopBLEApp: App {
                     if newPhase == .active {
                         bleManager.reEnableIfStreaming()
                         bleManager.refreshPedometer()
+                    }
+                    if newPhase == .background {
+                        BackgroundEngine.shared.scheduleOvernightTask()
                     }
                 }
         }

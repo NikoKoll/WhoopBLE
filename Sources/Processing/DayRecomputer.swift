@@ -4,7 +4,7 @@ import HealthKit
 enum AlgoVersions {
     static let hrv      = 4
     static let strain   = 3
-    static let sleep    = 11
+    static let sleep    = 12  // RMSSD-based stage classifier (REM/DEEP confirmed by HRV)
     static let recovery = 18  // bio day = wake calendar date (no noon shift); restored relevantKeys filter
 }
 
@@ -38,30 +38,21 @@ final class DayRecomputer: @unchecked Sendable {
 
     func computeHRV(rrSamples: [RawDataStore.RRSample]) -> (rmssd: Double, sdnn: Double)? {
         guard rrSamples.count >= 2 else { return nil }
-        var clean: [RawDataStore.RRSample] = []
-        for s in rrSamples {
-            let rr = Double(s.intervalMs)
-            if clean.count >= 5 {
-                let window = clean.suffix(10)
-                let mean = window.reduce(0.0) { $0 + Double($1.intervalMs) } / Double(window.count)
-                guard mean > 1.0 else { continue }
-                if abs(rr - mean) / mean > 0.20 { continue }
+        let processor = SignalProcessor()
+        // Filter with consecutive-pair gap guard (≤10s) preserved from original logic
+        var gapFiltered: [Double] = []
+        for i in 0..<rrSamples.count {
+            let rr = Double(rrSamples[i].intervalMs)
+            if i > 0 {
+                guard rrSamples[i].timestamp - rrSamples[i-1].timestamp <= 10 else { continue }
             }
-            clean.append(s)
+            gapFiltered.append(rr)
         }
-        guard clean.count >= 2 else { return nil }
-        let rr = clean.map { Double($0.intervalMs) }
-        var squaredDiffs: [Double] = []
-        for i in 0..<(clean.count - 1) {
-            guard clean[i+1].timestamp - clean[i].timestamp <= 10 else { continue }
-            let d = rr[i+1] - rr[i]
-            squaredDiffs.append(d * d)
-        }
-        // Require ≥5 valid pairs for a stable RMSSD; single-pair RMSSD is just |diff|.
-        guard squaredDiffs.count >= 5 else { return nil }
-        let rmssd = sqrt(squaredDiffs.reduce(0, +) / Double(squaredDiffs.count))
-        let mean = rr.reduce(0, +) / Double(rr.count)
-        let sdnn = sqrt(rr.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(rr.count - 1))
+        let filtered = processor.filterRR(gapFiltered)
+        guard filtered.value.count >= 2 else { return nil }
+        let rmssdMetric = processor.computeRMSSD(filtered.value)
+        let sdnnMetric  = processor.computeSDNN(filtered.value)
+        guard let rmssd = rmssdMetric.value, let sdnn = sdnnMetric.value else { return nil }
         return (rmssd, sdnn)
     }
 
@@ -190,7 +181,8 @@ final class DayRecomputer: @unchecked Sendable {
     // MARK: - Orchestrator
 
     func recomputeDay(date: Date, rawStore: RawDataStore, dailyStore: DailyMetricsStore,
-                               healthKit: HealthKitWriter? = nil) async {
+                               healthKit: HealthKitWriter? = nil, featureCache: FeatureCache? = nil,
+                               snapshotStore: SnapshotStore? = nil) async {
         await rawStore.flush()
         let hr = await rawStore.loadHR(for: date)
         let rr = await rawStore.loadRR(for: date)
@@ -429,6 +421,51 @@ final class DayRecomputer: @unchecked Sendable {
                 sleepVersion:     AlgoVersions.sleep,
                 recoveryVersion:  AlgoVersions.recovery
             ))
+
+            // Cache derived features so the next recompute for this date can skip clean subsystems.
+            if let cache = featureCache {
+                let processor = SignalProcessor()
+                let now = Date()
+                var features = FeatureCache.CachedFeatures(dirtyFlags: [], computedAt: now)
+                if let hrv = bioHRV {
+                    let delta = hrvBase.std > 0 ? (hrv - hrvBase.mean) / hrvBase.std : 0
+                    features.hrvDeviation   = Metric(value: delta, confidence: 1.0, sampleCount: 1, computedAt: now)
+                    let zScore = hrv > 0 ? (hrv - hrvBase.mean) / max(1, hrvBase.std) : 0
+                    features.autonomicStress = Metric(value: -zScore, confidence: 1.0, sampleCount: 1, computedAt: now)
+                }
+                if let rhr = bioRHR {
+                    let delta = rhrBase.std > 0 ? (rhr - rhrBase.mean) / rhrBase.std : 0
+                    features.rhrDeviation = Metric(value: delta, confidence: 1.0, sampleCount: 1, computedAt: now)
+                }
+                if let s = strain {
+                    features.acuteFatigue = Metric(value: s, confidence: 1.0, sampleCount: 1, computedAt: now)
+                }
+                let sleepDebtHours = max(0, Double(need.totalMinutes - totalSleepMin)) / 60.0
+                features.sleepDebt = Metric(value: sleepDebtHours, confidence: totalSleepMin > 0 ? 1.0 : 0.3,
+                                            sampleCount: 1, computedAt: now)
+                features.sleepConsistency = Metric(value: consistencyScore, confidence: 1.0, sampleCount: 1, computedAt: now)
+                _ = processor  // suppress unused warning; processor available for future signal quality calls
+                await cache.upsert(features, for: bioKey)
+            }
+
+            // Write/update snapshot for this bio day.
+            if let snapStore = snapshotStore {
+                let isTodayBioKey = bioKey == calKey
+                let snapshot = DailySnapshot(
+                    dateKey:          bioKey,
+                    finalizedAt:      Date(),
+                    recoveryScore:    breakdown.confidence >= 0.5 ? breakdown.overallScore : nil,
+                    strain:           strain,
+                    sleepMinutes:     totalSleepMin > 0 ? totalSleepMin : nil,
+                    sleepNeedMinutes: need.totalMinutes,
+                    sleepDebt:        max(0, Double(need.totalMinutes - totalSleepMin)) / 60.0,
+                    hrvRMSSD:         bioHRV,
+                    rhr:              bioRHR,
+                    algorithmVersion: AlgoVersions.recovery,
+                    isMutable:        isTodayBioKey
+                )
+                await snapStore.upsert(snapshot)
+            }
 
             let rhrStr  = bioRHR.map { String(format: "%.1f", $0) } ?? "nil"
             let rmsdStr = bioHRV.map { String(format: "%.1f ms", $0) } ?? "nil"

@@ -5,17 +5,21 @@ import HealthKit
 /// Accepts date strings, deduplicates, drains serially at background priority.
 actor RecomputeQueue {
 
-    private var pending:    Set<String> = []  // ISO date strings "2025-04-27"
-    private var isRunning:  Bool = false
-    private var rawStore:   RawDataStore?
-    private var dailyStore: DailyMetricsStore?
-    private var healthKit:  HealthKitWriter?
-    private let recomputer  = DayRecomputer()
+    private var pending:       Set<String> = []  // ISO date strings "2025-04-27"
+    private var isRunning:     Bool = false
+    private var rawStore:      RawDataStore?
+    private var dailyStore:    DailyMetricsStore?
+    private var healthKit:     HealthKitWriter?
+    private var featureCache:  FeatureCache?
+    private var snapshotStore: SnapshotStore?
+    private let recomputer     = DayRecomputer()
     private var onComplete: [@Sendable () async -> Void] = []
 
-    /// Inject HealthKitWriter so recomputeDay can use HK fallback reads.
-    func configure(healthKit: HealthKitWriter) {
-        self.healthKit = healthKit
+    /// Inject dependencies for recompute calls.
+    func configure(healthKit: HealthKitWriter, featureCache: FeatureCache? = nil, snapshotStore: SnapshotStore? = nil) {
+        self.healthKit     = healthKit
+        self.featureCache  = featureCache
+        self.snapshotStore = snapshotStore
     }
 
     /// Enqueue one or more dates. Starts drain loop if not already running.
@@ -47,7 +51,7 @@ actor RecomputeQueue {
                   let raw = rawStore,
                   let daily = dailyStore else { continue }
             print("[Recompute] processing \(key)")
-            await recomputer.recomputeDay(date: date, rawStore: raw, dailyStore: daily, healthKit: healthKit)
+            await recomputer.recomputeDay(date: date, rawStore: raw, dailyStore: daily, healthKit: healthKit, featureCache: featureCache, snapshotStore: snapshotStore)
         }
         isRunning = false
         print("[RecomputeQueue] drain complete")

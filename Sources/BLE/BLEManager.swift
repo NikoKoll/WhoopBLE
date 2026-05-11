@@ -17,6 +17,36 @@ func metForHR(_ bpm: Int, maxHR: Double? = nil) -> Double {
     return max(0, metTotal - 1.0)
 }
 
+// RSA (respiratory sinus arrhythmia): autocorrelation of linearly-detrended RR series.
+// Lag search 4–10 s → 6–15 breaths/min. Lags 2–3 excluded: dominated by HR inertia.
+// Requires 32+ samples and a clear autocorrelation peak (prominence ≥ 20% over neighbors).
+private func estimateRespiratoryRate(_ rr: [Double]) -> Double? {
+    guard rr.count >= 32 else { return nil }
+    let n = rr.count
+    // Linear detrend to remove HR drift before autocorrelation.
+    let xMean = (Double(n) - 1) / 2
+    let yMean = rr.reduce(0.0, +) / Double(n)
+    let sxx = (0..<n).reduce(0.0) { $0 + (Double($1) - xMean) * (Double($1) - xMean) }
+    let sxy = rr.enumerated().reduce(0.0) { acc, pair in acc + (Double(pair.offset) - xMean) * (pair.element - yMean) }
+    let slope = sxy / sxx
+    let detrended = rr.enumerated().map { pair in pair.element - (yMean + slope * (Double(pair.offset) - xMean)) }
+    // Lag 4–10 → 6–15 breaths/min.
+    let maxLag = min(10, n - 4)
+    guard maxLag >= 4 else { return nil }
+    var corrs: [Int: Double] = [:]
+    for lag in 4...maxLag {
+        corrs[lag] = (0..<(n - lag)).reduce(0.0) { $0 + detrended[$1] * detrended[$1 + lag] }
+    }
+    guard let bestLag = corrs.max(by: { $0.value < $1.value })?.key,
+          let bestCorr = corrs[bestLag], bestCorr > 0 else { return nil }
+    // Prominence: best lag must be ≥ 20% stronger than each immediate neighbor.
+    let prevCorr = corrs[bestLag - 1] ?? 0
+    let nextCorr = corrs[bestLag + 1] ?? 0
+    guard bestCorr >= prevCorr * 1.20, bestCorr >= nextCorr * 1.20 else { return nil }
+    let breathsPerMin = 60.0 / Double(bestLag)
+    return (breathsPerMin >= 6 && breathsPerMin <= 15) ? breathsPerMin : nil
+}
+
 private enum WUUID {
     static let service       = "61080001-8d6d-82b8-614a-1c8cb0f8dcc6"
     static let cmdTo         = "61080002"
@@ -68,6 +98,7 @@ final class BLEManager: NSObject, ObservableObject {
     // Rolling buffer of the last 60 valid RR intervals for RMSSD (§2.2)
     private var rrBuffer: [Double] = []
     private var hrvHistory: [Double] = []
+    private var lastRespRateLog: Date = .distantPast
 
     // Active energy accumulator — flushed to HealthKit every 3 minutes (Move ring)
     private var pendingEnergyKcal: Double = 0
@@ -94,6 +125,7 @@ final class BLEManager: NSObject, ObservableObject {
     let rawDataStore   = RawDataStore()
     let dailyMetrics   = DailyMetricsStore()
     let recomputeQueue = RecomputeQueue()
+    lazy var physiologicalStore = PhysiologicalStateStore(queue: recomputeQueue)
 
     // Wrist-wear state from GET_HELLO_HARVARD (0x35) ACK. nil until first strap response.
     @Published var isWristOn: Bool? = nil
@@ -118,6 +150,14 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var todaySleepNeedMinutes: Int? = nil
     // Most recent SpO2 reading (%) from HealthKit, nil if no sample in last 24h.
     @Published var latestSpO2: Double? = nil
+    // RSA-derived respiratory rate (breaths/min), updated every ~10s when RR data is available.
+    @Published var respiratoryRate: Double? = nil
+
+    // Pre-computed ring values — updated by refreshRecoveryFromStore so DashboardView does pure layout.
+    // sleepProgress: actual/need clamped 0–1; updated also when lastSleepSession changes.
+    @Published var sleepProgress: Double = 0
+    // strainTargetBand: recommended strain range based on recovery score.
+    @Published var strainTargetBand: (lo: Double, hi: Double) = (10.0, 14.0)
 
     // HealthKit capability flags (§9.11) — refreshed after authorization.
     @Published var hkRespRateAvailable = false
@@ -129,6 +169,7 @@ final class BLEManager: NSObject, ObservableObject {
     // Most recent sleep session from SyncManager. Mirrors what SleepView shows as "Last Night".
     @Published var lastSleepSession: SleepSession? = nil
     private let pedometer = CMPedometer()
+    private var cancellables = Set<AnyCancellable>()
 
     // nonisolated(unsafe): constant let, safe to read from any thread/Task.
     nonisolated(unsafe) private let bleQueue = DispatchQueue(label: "com.personal.WhoopBLE.ble", qos: .userInitiated)
@@ -169,6 +210,17 @@ final class BLEManager: NSObject, ObservableObject {
         syncManager.$sleepSessions
             .map { $0.sorted { $0.start > $1.start }.first }
             .assign(to: &$lastSleepSession)
+        $lastSleepSession
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateDerivedRingValues() }
+            .store(in: &cancellables)
+        // Configure physiological store — must happen after rawDataStore + dailyMetrics are set.
+        Task { [weak self] in
+            guard let self else { return }
+            await self.physiologicalStore.configure(rawStore: self.rawDataStore, dailyStore: self.dailyMetrics)
+            // Publish cached scores from last session immediately — before BLE connects.
+            await self.publishSnapshotIfAvailable()
+        }
         startPedometer()
         // RestoreIdentifierKey enables iOS to relaunch the app after killing it under memory
         // pressure — the system calls centralManager(_:willRestoreState:) on relaunch so we
@@ -241,11 +293,11 @@ final class BLEManager: NSObject, ObservableObject {
         let allKeys = Set(staleHRV + staleStrain + staleSleep + staleRecovery + [todayKey])
         let dates = allKeys.compactMap { parseISODateString($0) }
         print("[BLEManager] enqueuing \(dates.count) date(s) for recompute")
-        await recomputeQueue.configure(healthKit: healthKit)
-        await recomputeQueue.enqueue(dates: dates, rawStore: rawDataStore, dailyStore: dailyMetrics) {
-            [weak self] in
-            await self?.refreshRecoveryFromStore()
+        await recomputeQueue.configure(healthKit: healthKit, featureCache: physiologicalStore.featureCache, snapshotStore: physiologicalStore.snapshotStore)
+        for date in dates {
+            await physiologicalStore.handle(.recomputeRequested(date: date))
         }
+        await refreshRecoveryFromStore()
     }
 
     /// Force-recompute every stored day plus the last 14 calendar days.
@@ -269,11 +321,9 @@ final class BLEManager: NSObject, ObservableObject {
         // leaving orphan rows under old keys that no recompute will overwrite.
         await dailyMetrics.deleteAll()
         print("[BLEManager] forceRecomputeAll → \(dates.count) day(s) after wipe")
-        await recomputeQueue.configure(healthKit: healthKit)
-        await recomputeQueue.enqueue(dates: dates, rawStore: rawDataStore, dailyStore: dailyMetrics) {
-            [weak self] in
-            await self?.refreshRecoveryFromStore()
-        }
+        await recomputeQueue.configure(healthKit: healthKit, featureCache: physiologicalStore.featureCache, snapshotStore: physiologicalStore.snapshotStore)
+        await physiologicalStore.handle(.forceRecomputeAll)
+        await refreshRecoveryFromStore()
     }
 
     /// Refresh HealthKit capability flags and run one-time workout migration.
@@ -291,8 +341,8 @@ final class BLEManager: NSObject, ObservableObject {
         let affectedDates = await migrator.migrateIfNeeded()
         if !affectedDates.isEmpty {
             let dates = affectedDates.compactMap { parseISODateString($0) }
-            await recomputeQueue.configure(healthKit: healthKit)
-            await recomputeQueue.enqueue(dates: dates, rawStore: rawDataStore, dailyStore: dailyMetrics)
+            await recomputeQueue.configure(healthKit: healthKit, featureCache: physiologicalStore.featureCache, snapshotStore: physiologicalStore.snapshotStore)
+            await physiologicalStore.handle(.batchSyncCompleted(dates: dates))
         }
     }
 
@@ -349,7 +399,52 @@ final class BLEManager: NSObject, ObservableObject {
             self.todayStrain               = strain
             self.todaySleepMinutes         = sleepMin
             self.todaySleepNeedMinutes     = sleepNeed
+            self.updateDerivedRingValues()
         }
+    }
+
+    // Recomputes pre-published ring values from current @Published state.
+    // Called after any update to sleep/strain/recovery data.
+    @MainActor func updateDerivedRingValues() {
+        // Sleep progress: session minutes vs need
+        let sessionMin: Int
+        if let s = lastSleepSession {
+            let total = Int(s.end.timeIntervalSince(s.start) / 60)
+            let wake  = s.briefWakeTotalSeconds / 60
+            sessionMin = max(0, total - wake)
+        } else {
+            sessionMin = todaySleepMinutes ?? 0
+        }
+        if sessionMin > 0, let need = todaySleepNeedMinutes, need > 0 {
+            sleepProgress = min(Double(sessionMin) / Double(need), 1.0)
+        } else {
+            sleepProgress = 0
+        }
+
+        // Strain target band: recovery-gated recommended range
+        if let recovery = recoveryScore {
+            if recovery >= 67 { strainTargetBand = (14.0, 18.0) }
+            else if recovery >= 34 { strainTargetBand = (10.0, 14.0) }
+            else { strainTargetBand = (6.0, 10.0) }
+        } else {
+            strainTargetBand = (10.0, 14.0)
+        }
+    }
+
+    // MARK: - Cold-launch snapshot publish
+
+    /// Reads today's DailySnapshot from disk and populates published vars immediately —
+    /// before BLE connects and before recompute runs. Gives instant dashboard on app open.
+    private func publishSnapshotIfAvailable() async {
+        let snapshot = await physiologicalStore.snapshotStore.loadToday()
+        guard let snap = snapshot else { return }
+        await MainActor.run {
+            if recoveryScore == nil    { recoveryScore    = snap.recoveryScore }
+            if todayStrain  == nil     { todayStrain      = snap.strain }
+            if todaySleepMinutes == nil { todaySleepMinutes = snap.sleepMinutes }
+            if todaySleepNeedMinutes == nil { todaySleepNeedMinutes = snap.sleepNeedMinutes }
+        }
+        print("[BLEManager] cold-launch snapshot loaded for \(snap.dateKey) — recovery=\(snap.recoveryScore.map { String(format: "%.0f", $0) } ?? "nil")")
     }
 
     // MARK: - Re-detect sleep from stored HR
@@ -433,12 +528,9 @@ final class BLEManager: NSObject, ObservableObject {
 
         // Trigger recompute of affected days so DailyMetrics rows pick up new sleepMinutes.
         let uniqueDates = Array(Set(affectedDates))
-        await recomputeQueue.configure(healthKit: healthKit)
-        await recomputeQueue.enqueue(dates: uniqueDates,
-                                     rawStore: rawDataStore,
-                                     dailyStore: dailyMetrics) { [weak self] in
-            await self?.refreshRecoveryFromStore()
-        }
+        await recomputeQueue.configure(healthKit: healthKit, featureCache: physiologicalStore.featureCache, snapshotStore: physiologicalStore.snapshotStore)
+        await physiologicalStore.handle(.batchSyncCompleted(dates: uniqueDates))
+        await refreshRecoveryFromStore()
         print("[Redetect] added \(newSessions.count) session(s), recompute queued for \(uniqueDates.count) date(s)")
         return newSessions.count
     }
@@ -577,21 +669,37 @@ final class BLEManager: NSObject, ObservableObject {
             }
             if self.rrBuffer.count > 60 { self.rrBuffer.removeFirst(self.rrBuffer.count - 60) }
 
-            // Recompute RMSSD from rolling buffer if we have enough (never clears lastHRV on empty-RR updates)
+            // Recompute RMSSD via SignalProcessor (never clears lastHRV on empty-RR updates)
             var freshHRV: Double? = nil
             if self.rrBuffer.count >= 4 {
-                let diffs = zip(self.rrBuffer, self.rrBuffer.dropFirst()).map { a, b -> Double in
-                    let d = (b - a) * 1000; return d * d
+                let metric = SignalProcessor().computeRMSSD(self.rrBuffer.map { $0 * 1000 })
+                if let rmssd = metric.value {
+                    freshHRV = rmssd
+                    self.lastHRV = rmssd
+                    self.hrvHistory.append(rmssd)
+                    if self.hrvHistory.count > 5 { self.hrvHistory.removeFirst() }
+                    self.smoothedHRV = self.hrvHistory.reduce(0, +) / Double(self.hrvHistory.count)
+                    // WHOOP-style normalized score: ln(RMSSD_ms) / 6.5 × 100
+                    self.whoopHRVScore = min(100, max(0, log(rmssd) / 6.5 * 100))
+                    // Notify physiological store — enables dirty-flag invalidation without blocking UI
+                    let ts = metrics.timestamp
+                    Task { [weak self] in
+                        guard let self else { return }
+                        await self.physiologicalStore.handle(.hrvUpdated(rmssd: rmssd, timestamp: ts))
+                    }
                 }
-                let rmssd = sqrt(diffs.reduce(0, +) / Double(diffs.count))
-                freshHRV = rmssd
-                self.lastHRV = rmssd
-                self.hrvHistory.append(rmssd)
-                if self.hrvHistory.count > 5 { self.hrvHistory.removeFirst() }
-                self.smoothedHRV = self.hrvHistory.reduce(0, +) / Double(self.hrvHistory.count)
-                // WHOOP-style normalized score: ln(RMSSD_ms) / 6.5 × 100
-                self.whoopHRVScore = min(100, max(0, log(rmssd) / 6.5 * 100))
             }
+
+            // Respiratory rate (RSA autocorrelation, updated every 10s)
+            let rrCount = self.rrBuffer.count
+            if rrCount >= 32, Date().timeIntervalSince(self.lastRespRateLog) >= 10 {
+                self.lastRespRateLog = Date()
+                if let resp = estimateRespiratoryRate(self.rrBuffer) {
+                    self.respiratoryRate = resp
+                    print("[RespRate] \(String(format: "%.1f", resp)) breaths/min (rrBuf=\(rrCount))")
+                }
+            }
+
             self.metricsStore.record(timestamp: metrics.timestamp,
                                      heartRate: metrics.heartRate,
                                      hrv: freshHRV)
@@ -804,6 +912,16 @@ extension BLEManager: CBPeripheralDelegate {
             } else if uuid.hasPrefix(WUUID.memfault) {
                 self.memfault = char
                 peripheral.setNotifyValue(true, for: char)
+            } else {
+                // Unknown characteristic — log for RE analysis (may carry SpO2, skin temp, etc.)
+                let props = char.properties
+                var propStr: [String] = []
+                if props.contains(.notify) { propStr.append("notify") }
+                if props.contains(.read)   { propStr.append("read") }
+                if props.contains(.write)  { propStr.append("write") }
+                print("[CharScan] unknown char: \(uuid) props=[\(propStr.joined(separator: ","))]")
+                if props.contains(.notify) { peripheral.setNotifyValue(true, for: char) }
+                else if props.contains(.read) { peripheral.readValue(for: char) }
             }
         }
         print("✅ characteristics found — cmdTo:\(cmdToStrap != nil) events:\(eventsFromStrap != nil) data:\(dataFromStrap != nil)")
@@ -976,7 +1094,10 @@ extension BLEManager: CBPeripheralDelegate {
                 }
             }
             if lastDecodedHR > 0, abs(hr - lastDecodedHR) > 25 {
-                print("⚠️ std HR jump \(lastDecodedHR)→\(hr) rejected"); return
+                #if DEBUG
+                print("⚠️ std HR jump \(lastDecodedHR)→\(hr) rejected")
+                #endif
+                return
             }
             lastDecodedHR = hr
             acceptMetrics(WhoopMetrics(timestamp: Date(), heartRate: hr, rrIntervals: rrIntervals))
@@ -996,13 +1117,25 @@ extension BLEManager: CBPeripheralDelegate {
             return
         }
 
+        // Log unknown characteristic data for RE analysis (SpO2, skin temp candidates)
+        let isKnownUUID = uuidShort.hasPrefix("2a19") || uuidShort.hasPrefix("2a37")
+            || uuidShort.hasPrefix(WUUID.cmdFrom) || uuidShort.hasPrefix(WUUID.data)
+            || uuidShort.hasPrefix(WUUID.events) || uuidShort.hasPrefix(WUUID.memfault)
+        if !isKnownUUID {
+            let hex = data.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " ")
+            print("[CharScan] data from \(uuidShort.prefix(8)): \(hex) (\(data.count)B)")
+            return
+        }
+
         guard uuidShort.hasPrefix(WUUID.events) else { return }
 
         if let metrics = PacketDecoder.decode(data) {
             // Reject readings that jump more than 25 BPM from the last accepted value.
             let hr = metrics.heartRate
             if lastDecodedHR > 0, abs(hr - lastDecodedHR) > 25 {
+                #if DEBUG
                 print("⚠️ HR jump \(lastDecodedHR)→\(hr) rejected")
+                #endif
                 return
             }
             lastDecodedHR = hr
@@ -1016,7 +1149,9 @@ extension BLEManager: CBPeripheralDelegate {
                   bytes[0] == 0xaa,
                   (bytes[3] == 0x57 || bytes[3] == 0xab || bytes[3] == 0x52),
                   lastDecodedHR > 0 else {
+                #if DEBUG
                 print("⚠️ rejected (count=\(data.count) byte3=\(data.count > 3 ? String(format: "%02x", data[3]) : "?"))")
+                #endif
                 return
             }
             let rrCount = min(Int(bytes[11]), 4)
@@ -1030,7 +1165,9 @@ extension BLEManager: CBPeripheralDelegate {
             guard !rrs.isEmpty else { return }
             // Use last known HR so the RR data lands in acceptMetrics with a valid heartRate.
             acceptMetrics(WhoopMetrics(timestamp: Date(), heartRate: lastDecodedHR, rrIntervals: rrs))
+            #if DEBUG
             print("💓 RR-only from 0x\(String(format: "%02x", bytes[3])): \(rrs.map { Int($0 * 1000) })")
+            #endif
         }
     }
 }

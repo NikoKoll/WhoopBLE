@@ -4,7 +4,7 @@ import Foundation
 final class SyncManager: ObservableObject {
 
     // MARK: - Debug flag
-    static let debugLogging = true
+    static let debugLogging = false
 
     // MARK: - Published state
     @Published var isSyncing = false
@@ -313,7 +313,7 @@ final class SyncManager: ObservableObject {
         }
         guard let batchID = activeBatchID else { return }
         activeChunks.append(data)
-        print("[SyncManager] chunk \(activeChunks.count) for batch \(batchID)")
+        if SyncManager.debugLogging { print("[SyncManager] chunk \(activeChunks.count) for batch \(batchID)") }
 
         // Reset 3-second idle timer — finalize once chunks stop arriving
         chunkIdleTask?.cancel()
@@ -566,10 +566,8 @@ final class SyncManager: ObservableObject {
             .compactMap { parseISODateString($0) }
         if !affected.isEmpty, let ble = bleManager {
             Task {
-                await ble.recomputeQueue.enqueue(dates: affected, rawStore: ble.rawDataStore, dailyStore: ble.dailyMetrics) { [weak ble] in
-                    guard let ble else { return }
-                    Task { @MainActor in await ble.refreshRecoveryFromStore() }
-                }
+                await ble.physiologicalStore.handle(.batchSyncCompleted(dates: affected))
+                await ble.refreshRecoveryFromStore()
             }
         }
         print("[SyncManager] updated sleep session \(session.id) (\(old.start)→\(old.end)) ⇒ (\(session.start)→\(session.end))")
@@ -585,10 +583,8 @@ final class SyncManager: ObservableObject {
         let affected = Set(affectedDateKeys(for: session)).compactMap { parseISODateString($0) }
         if !affected.isEmpty, let ble = bleManager {
             Task {
-                await ble.recomputeQueue.enqueue(dates: affected, rawStore: ble.rawDataStore, dailyStore: ble.dailyMetrics) { [weak ble] in
-                    guard let ble else { return }
-                    Task { @MainActor in await ble.refreshRecoveryFromStore() }
-                }
+                await ble.physiologicalStore.handle(.sleepDeleted(id: id))
+                await ble.refreshRecoveryFromStore()
             }
         }
         print("[SyncManager] deleted sleep session \(id)")
@@ -865,10 +861,8 @@ final class SyncManager: ObservableObject {
             Task {
                 if !batchHR.isEmpty { await ble.rawDataStore.appendHRBatch(batchHR) }
                 if !batchRR.isEmpty { await ble.rawDataStore.appendRRBatch(batchRR) }
-                await ble.recomputeQueue.enqueue(dates: dates, rawStore: ble.rawDataStore, dailyStore: ble.dailyMetrics) { [weak ble] in
-                    guard let ble else { return }
-                    await ble.refreshRecoveryFromStore()
-                }
+                await ble.physiologicalStore.handle(.batchSyncCompleted(dates: dates))
+                await ble.refreshRecoveryFromStore()
             }
             print("[Recompute] sync done — queued \(dates.count) date(s), HR=\(batchHR.count) RR=\(batchRR.count)")
         }

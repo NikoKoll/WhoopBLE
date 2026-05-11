@@ -52,6 +52,9 @@ targets:
         NSMotionUsageDescription: "Counts your daily steps and detects sleep using iPhone motion sensors."
         UIBackgroundModes:
           - bluetooth-central
+          - processing
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.personal.WhoopBLE.overnight
         UILaunchScreen:
           UIColorName: ""
           UIImageName: ""

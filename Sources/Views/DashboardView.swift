@@ -83,16 +83,13 @@ struct DashboardView: View {
         }
         return ble.todaySleepMinutes ?? 0
     }
-    private var sleepProgress: Double {
-        guard sleepSessionMinutes > 0,
-              let need = ble.todaySleepNeedMinutes, need > 0 else { return 0 }
-        return min(Double(sleepSessionMinutes) / Double(need), 1.0)
-    }
-    private var sleepPct: Int { Int(sleepProgress * 100) }
+    // sleepProgress sourced from BLEManager.sleepProgress (pre-computed)
+    private var sleepPct: Int { Int(ble.sleepProgress * 100) }
     private var sleepColor: Color {
         guard ble.lastSleepSession != nil || ble.todaySleepMinutes != nil else { return .gray.opacity(0.35) }
-        if sleepPct >= 85 { return .green }
-        if sleepPct >= 70 { return .yellow }
+        let pct = Int(ble.sleepProgress * 100)
+        if pct >= 85 { return .green }
+        if pct >= 70 { return .yellow }
         return .red
     }
     private var sleepSubtitle: String {
@@ -105,15 +102,10 @@ struct DashboardView: View {
 
     // MARK: - Strain ring computed values
     private var strainProgress: Double { (ble.todayStrain ?? 0) / 21.0 }
-    private var strainTargetBand: (lo: Double, hi: Double) {
-        guard let recovery = ble.recoveryScore else { return (10.0, 14.0) }
-        if recovery >= 67 { return (14.0, 18.0) }
-        if recovery >= 34 { return (10.0, 14.0) }
-        return (6.0, 10.0)
-    }
+    // strainTargetBand sourced from BLEManager.strainTargetBand (pre-computed)
     private var strainColor: Color {
         guard let strain = ble.todayStrain else { return .gray.opacity(0.35) }
-        let band = strainTargetBand
+        let band = ble.strainTargetBand
         if strain < band.lo { return .yellow }
         if strain > band.hi { return .red }
         return .green
@@ -303,6 +295,27 @@ struct DashboardView: View {
                 }
             }
             .frame(maxWidth: .infinity)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(width: 1, height: 40)
+
+            VStack(spacing: 4) {
+                let respStr = ble.respiratoryRate.map { "\(Int($0.rounded()))" } ?? "—"
+                Text(respStr)
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .contentTransition(.numericText())
+                    .animation(.smoothFallback(), value: ble.respiratoryRate)
+                Text("RESP")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.45))
+                    .kerning(2.0)
+                Text("brpm")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.3))
+            }
+            .frame(maxWidth: .infinity)
         }
     }
 
@@ -318,7 +331,7 @@ struct DashboardView: View {
                 .stroke(Color.white.opacity(0.08), lineWidth: 8)
                 .frame(width: 88, height: 88)
             Circle()
-                .trim(from: 0, to: sleepProgress)
+                .trim(from: 0, to: ble.sleepProgress)
                 .stroke(
                     AngularGradient(
                         colors: [sleepColor.opacity(0.45), sleepColor, sleepColor.opacity(0.85)],
@@ -329,7 +342,7 @@ struct DashboardView: View {
                 .frame(width: 88, height: 88)
                 .rotationEffect(.degrees(-90))
                 .shadow(color: sleepColor.opacity(0.45), radius: 6)
-                .animation(.smoothFallback(duration: 0.6), value: sleepProgress)
+                .animation(.smoothFallback(duration: 0.6), value: ble.sleepProgress)
 
             VStack(spacing: 1) {
                 Text(ble.todaySleepMinutes != nil || ble.lastSleepSession != nil ? "\(sleepPct)%" : "—")
@@ -352,7 +365,7 @@ struct DashboardView: View {
     // MARK: - Strain Ring
 
     private var strainRing: some View {
-        let band = strainTargetBand
+        let band = ble.strainTargetBand
         let bandLo = band.lo / 21.0
         let bandHi = band.hi / 21.0
         return ZStack {
