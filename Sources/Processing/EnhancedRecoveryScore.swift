@@ -9,6 +9,7 @@ struct EnhancedRecoveryScore {
     static let popRHR: (mean: Double, std: Double) = (62, 8)
     static let popSleep: (mean: Double, std: Double) = (420, 60)
     static let popStrain: (mean: Double, std: Double) = (10, 4)
+    static let popRR: (mean: Double, std: Double) = (14.0, 2.0)   // adult sleep mean RR ≈ 12–16 bpm
 
     static func compute(
         hrv: Double?,
@@ -28,13 +29,23 @@ struct EnhancedRecoveryScore {
         rhrBaseline: (mean: Double, std: Double)?,
         sleepBaseline: (mean: Double, std: Double)?,
         strainBaseline: (mean: Double, std: Double)?,
-        biologicalDateKey: String
+        biologicalDateKey: String,
+        // Phase 2 additions
+        respiratoryRate: Double? = nil,
+        respiratoryBaseline: (mean: Double, std: Double)? = nil,
+        confHRV: Double = 1.0,
+        confRHR: Double = 1.0,
+        confRR: Double = 0.0,
+        readinessCapacity: Double = 1.0,
+        illnessFlag: Bool = false
     ) -> RecoveryBreakdown {
 
         let hb = hrvBaseline ?? popHRV
         let rb = rhrBaseline ?? popRHR
         let sb = sleepBaseline ?? popSleep
         let stb = strainBaseline ?? (mean: 10.0, std: 4.0)
+        let rrb = respiratoryBaseline ?? popRR
+        _ = stb  // retained for breakdown completeness; strain no longer subtracts from composite
 
         func z(_ v: Double, _ b: (mean: Double, std: Double)) -> Double {
             guard b.std > 1e-6 else { return 0 }
@@ -46,12 +57,35 @@ struct EnhancedRecoveryScore {
             return 50.0 + 40.0 * tanh(signed)
         }
 
-        // --- 1. Autonomic Recovery (no timing penalty) ---
-        let hrvZ = hrv.map { z($0, hb) } ?? 0
-        let rhrZ = rhr.map { z($0, rb) } ?? 0
-        let strainZ = strain.map { z($0, stb) } ?? 0
-        // Higher HRV is better (+); lower RHR and lower strain are better (–).
-        let autonomicComposite = 0.5 * hrvZ - 0.3 * rhrZ - 0.2 * strainZ
+        // --- 1. Autonomic Recovery (Phase 2: HRV + RHR + RR + balance, NO strain) ---
+        //
+        // Confidence-shrunk z-scores: low signal quality blends toward population mean (z=0).
+        // Effective weights renormalize when RR is unavailable.
+        let rawHrvZ = hrv.map { z($0, hb) } ?? 0
+        let rawRhrZ = rhr.map { z($0, rb) } ?? 0
+        let rawRrZ  = respiratoryRate.map { z($0, rrb) } ?? 0
+
+        let hrvZ_eff = rawHrvZ * confHRV
+        let rhrZ_eff = rawRhrZ * confRHR
+        let rrZ_eff  = rawRrZ  * confRR
+
+        // Coupled response: HRV up + RHR down rewarded. (Both eff terms move opposite → negative sum → positive balance.)
+        let balance = -((hrvZ_eff + rhrZ_eff) / 2.0)
+
+        let autonomicComposite: Double
+        if confRR > 0 {
+            autonomicComposite =
+                0.45 * hrvZ_eff
+              - 0.25 * rhrZ_eff
+              - 0.20 * rrZ_eff
+              + 0.10 * balance
+        } else {
+            // RR unavailable — renormalize HRV/RHR to 0.55/0.30, balance 0.05.
+            autonomicComposite =
+                0.55 * hrvZ_eff
+              - 0.30 * rhrZ_eff
+              + 0.05 * balance
+        }
         let autonomicRecovery = clampScore(zToScore(autonomicComposite, true))
 
         // --- 2. Sleep Quantity vs Personalized Need ---
@@ -98,7 +132,7 @@ struct EnhancedRecoveryScore {
         let effectiveStageQuality = clampScore(rawStage * stageMod)
 
         // --- Composite (naps: consistency + fragmentation at 25% credit) ---
-        let finalScore = clampScore(
+        var finalScore = clampScore(
             autonomicRecovery     * RecoveryBreakdown.weightAutonomic
             + effectiveQuantity   * RecoveryBreakdown.weightQuantity
             + effectiveEfficiency * RecoveryBreakdown.weightEfficiency
@@ -107,6 +141,12 @@ struct EnhancedRecoveryScore {
             + rawFragmentation * napConsistencyFactor * RecoveryBreakdown.weightFragmentation
             + effectiveStageQuality * RecoveryBreakdown.weightStageQuality
         )
+
+        // --- Phase 2 hidden-state modulation ---
+        // Capacity 0..1 dampens output ±15%. Illness latch further damps ×0.85.
+        let capacityClamped = max(0.2, min(1.0, readinessCapacity))
+        finalScore = clampScore(finalScore * (0.85 + 0.15 * capacityClamped))
+        if illnessFlag { finalScore = clampScore(finalScore * 0.85) }
 
         // --- Confidence ---
         let hasHRV = hrv != nil ? 1.0 : 0.0

@@ -31,8 +31,16 @@ final class BiologicalDay {
         }
 
         return groups.map { date, data in
-            let totalMin = data.sessions.reduce(0) {
-                $0 + Int($1.end.timeIntervalSince($1.start) / 60) - ($1.briefWakeTotalSeconds / 60)
+            // Sum only non-nap sessions. Naps still live in `episodes` for
+            // fragmentation / efficiency, and continue to count toward nap-credit
+            // inside SleepNeedCalculator. Without this gate, main + multiple
+            // afternoon naps were merging into one bio-day totaling 14h+ sleep
+            // and breaking efficiency / recovery downstream.
+            let totalMin = zip(data.sessions, data.classifications).reduce(0) { acc, pair in
+                let (s, c) = pair
+                guard c.type != .nap else { return acc }
+                let raw = Int(s.end.timeIntervalSince(s.start) / 60) - (s.briefWakeTotalSeconds / 60)
+                return acc + max(0, raw)
             }
 
             let primary: SleepEpisodeType

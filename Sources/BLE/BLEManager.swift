@@ -99,6 +99,7 @@ final class BLEManager: NSObject, ObservableObject {
     private var rrBuffer: [Double] = []
     private var hrvHistory: [Double] = []
     private var lastRespRateLog: Date = .distantPast
+    private var respRateBuffer: [Double] = []   // rolling last 5 RSA estimates → published median
 
     // Active energy accumulator — flushed to HealthKit every 3 minutes (Move ring)
     private var pendingEnergyKcal: Double = 0
@@ -205,7 +206,12 @@ final class BLEManager: NSObject, ObservableObject {
             }
         }
         liveSleep.onSessionEnd = { [weak self] session in
-            Task { @MainActor [weak self] in self?.syncManager.addSleepSession(session) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.syncManager.addSleepSession(session)
+                await self.physiologicalStore.handle(.sleepEnded(session: session))
+                await self.refreshRecoveryFromStore()
+            }
         }
         syncManager.$sleepSessions
             .map { $0.sorted { $0.start > $1.start }.first }
@@ -218,6 +224,24 @@ final class BLEManager: NSObject, ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             await self.physiologicalStore.configure(rawStore: self.rawDataStore, dailyStore: self.dailyMetrics)
+            // Register hidden-state callback so each per-bio-day recompute flows into
+            // PhysiologicalStateStore.updateScores → @MainActor UI.
+            let store = self.physiologicalStore
+            await self.recomputeQueue.configure(
+                healthKit: self.healthKit,
+                featureCache: store.featureCache,
+                snapshotStore: store.snapshotStore,
+                onScoresUpdated: { [weak self] _, capacity, atl, ctl, debtHours, stress in
+                    await store.updateScores(
+                        readiness: capacity * 100.0,   // capacity is 0..1; readinessCapacity field is 0..100
+                        acuteFatigue: atl,
+                        chronicLoad: ctl,
+                        sleepDebt: debtHours,
+                        autonomicStress: stress
+                    )
+                    await self?.refreshRecoveryFromStore()
+                }
+            )
             // Publish cached scores from last session immediately — before BLE connects.
             await self.publishSnapshotIfAvailable()
         }
@@ -281,16 +305,18 @@ final class BLEManager: NSObject, ObservableObject {
         // Load whatever is already persisted — shown immediately while recompute runs.
         await refreshRecoveryFromStore()
 
-        let staleHRV      = await dailyMetrics.datesNeedingRecompute(metric: "hrv",      below: AlgoVersions.hrv)
-        let staleStrain   = await dailyMetrics.datesNeedingRecompute(metric: "strain",   below: AlgoVersions.strain)
-        let staleSleep    = await dailyMetrics.datesNeedingRecompute(metric: "sleep",    below: AlgoVersions.sleep)
-        let staleRecovery = await dailyMetrics.datesNeedingRecompute(metric: "recovery", below: AlgoVersions.recovery)
+        let staleHRV      = await dailyMetrics.datesNeedingRecompute(metric: "hrv",             below: AlgoVersions.hrv)
+        let staleStrain   = await dailyMetrics.datesNeedingRecompute(metric: "strain",          below: AlgoVersions.strain)
+        let staleSleep    = await dailyMetrics.datesNeedingRecompute(metric: "sleep",           below: AlgoVersions.sleep)
+        let staleRecovery = await dailyMetrics.datesNeedingRecompute(metric: "recovery",        below: AlgoVersions.recovery)
+        let stalePhysio   = await dailyMetrics.datesNeedingRecompute(metric: "physiology",      below: AlgoVersions.physiology)
+        let staleResp     = await dailyMetrics.datesNeedingRecompute(metric: "respiratoryRate", below: AlgoVersions.respiratoryRate)
         // Always include today — a missing row (no prior recompute yet) would otherwise be skipped.
         var utcCal = Calendar(identifier: .gregorian)
         utcCal.timeZone = TimeZone(identifier: "UTC")!
         let c = utcCal.dateComponents([.year, .month, .day], from: Date())
         let todayKey = String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
-        let allKeys = Set(staleHRV + staleStrain + staleSleep + staleRecovery + [todayKey])
+        let allKeys = Set(staleHRV + staleStrain + staleSleep + staleRecovery + stalePhysio + staleResp + [todayKey])
         let dates = allKeys.compactMap { parseISODateString($0) }
         print("[BLEManager] enqueuing \(dates.count) date(s) for recompute")
         await recomputeQueue.configure(healthKit: healthKit, featureCache: physiologicalStore.featureCache, snapshotStore: physiologicalStore.snapshotStore)
@@ -373,17 +399,18 @@ final class BLEManager: NSObject, ObservableObject {
         let circadianPenalty = scoreRow?.circadianPenalty
         let sleepType = scoreRow?.sleepTypeCode.map { SleepEpisodeType(rawValue: $0) ?? nil } ?? nil
 
-        // Strain + sleep: only current or previous calendar day — stale days are misleading.
-        var utcCal = Calendar(identifier: .gregorian)
-        utcCal.timeZone = TimeZone(identifier: "UTC")!
-        let now = Date()
-        func isoKey(_ d: Date) -> String {
-            let c = utcCal.dateComponents([.year, .month, .day], from: d)
-            return String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
+        // Strain + sleep: scan last 2 days of bio-day-keyed rows. Bio-day key may
+        // not align with UTC calendar day (wake-date depends on local-vs-UTC offset),
+        // so filtering by exact todayKey/yesterdayKey can miss the relevant row.
+        // Cap at 2 days age — anything older is stale.
+        var utcCalForStrain = Calendar(identifier: .gregorian)
+        utcCalForStrain.timeZone = TimeZone(identifier: "UTC")!
+        let todayStartStrain = utcCalForStrain.startOfDay(for: Date())
+        func ageDaysStrain(_ row: DailyMetricsStore.DailyMetrics) -> Int {
+            guard let d = parseISODateString(row.date) else { return 99 }
+            return utcCalForStrain.dateComponents([.day], from: d, to: todayStartStrain).day ?? 99
         }
-        let todayKey     = isoKey(now)
-        let yesterdayKey = isoKey(now.addingTimeInterval(-86400))
-        let recent = sorted.filter { $0.date == todayKey || $0.date == yesterdayKey }
+        let recent = sorted.filter { ageDaysStrain($0) <= 2 }
 
         let strain    = recent.first(where: { $0.strainScore      != nil })?.strainScore
         let sleepMin  = recent.first(where: { $0.sleepMinutes     != nil })?.sleepMinutes
@@ -695,8 +722,15 @@ final class BLEManager: NSObject, ObservableObject {
             if rrCount >= 32, Date().timeIntervalSince(self.lastRespRateLog) >= 10 {
                 self.lastRespRateLog = Date()
                 if let resp = estimateRespiratoryRate(self.rrBuffer) {
-                    self.respiratoryRate = resp
-                    print("[RespRate] \(String(format: "%.1f", resp)) breaths/min (rrBuf=\(rrCount))")
+                    // Median-of-5 smoothing. RSA autocorr bestLag flips between 5 and 8
+                    // across runs even on a steady wearer; single-sample publish exposed
+                    // that noise (logged 12, UI showed 7). 5-tick window ≈ 50 s.
+                    self.respRateBuffer.append(resp)
+                    if self.respRateBuffer.count > 5 { self.respRateBuffer.removeFirst() }
+                    let sorted = self.respRateBuffer.sorted()
+                    let median = sorted[sorted.count / 2]
+                    self.respiratoryRate = median
+                    print("[RespRate] inst=\(String(format: "%.1f", resp)) median=\(String(format: "%.1f", median)) (rrBuf=\(rrCount), n=\(sorted.count))")
                 }
             }
 

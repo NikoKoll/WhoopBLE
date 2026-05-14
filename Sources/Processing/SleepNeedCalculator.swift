@@ -40,11 +40,24 @@ struct SleepNeedCalculator {
             baseline = 480
         }
 
-        // --- Strain adjustment: yesterday's strain → 0–60 min extra need ---
+        // --- Fatigue/stress adjustment (Phase 2) ---
+        // Replaces linear strain term. Reads yesterday's hidden physiological state
+        // (acuteFatigue ATL, autonomicStress) and produces 0..~105 min asymptotic adjustment.
+        // Cold-start fallback: if no prior physiology recorded, fall back to old strain-linear
+        // adjustment so warmup days still produce reasonable sleep-need targets.
         let yesterday = utcCal.date(byAdding: .day, value: -1, to: date) ?? date
         let yesterdayKey = isoDate(for: yesterday)
-        let yesterdayStrain = dailyMetrics.first(where: { $0.date == yesterdayKey })?.strainScore ?? 0
-        let strainAdj = min(60, Int((yesterdayStrain / 21.0) * 60.0))
+        let yesterdayMetrics = dailyMetrics.first(where: { $0.date == yesterdayKey })
+        let strainAdj: Int
+        if let af = yesterdayMetrics?.acuteFatigue, let auto = yesterdayMetrics?.autonomicStress {
+            strainAdj = PhysiologicalDynamics.fatigueAdjMinutes(
+                acuteFatigue: af,
+                autonomicStress: auto
+            )
+        } else {
+            let fallbackStrain = yesterdayMetrics?.strainScore ?? 0
+            strainAdj = min(60, Int((fallbackStrain / 21.0) * 60.0))
+        }
 
         // --- Sleep debt: sum of shortfalls over last 7 days, capped at 120 min ---
         // Each day's recovery is capped at -30 min so one great night can't zero out a week of debt.

@@ -17,10 +17,22 @@ actor DailyMetricsStore {
         var recoveryConfidence: Double? = nil
         var sleepMidpointMin: Int? = nil
         var recoveryComponents: RecoveryBreakdown? = nil
+        // Phase 2 — respiratory + hidden physiological state
+        var respiratoryRate: Double? = nil          // breaths/min, sleep-window mean
+        var respiratoryConfidence: Double? = nil    // 0..1
+        var acuteFatigue: Double? = nil             // ATL (EWMA strainLoad, α=0.27)
+        var chronicLoad: Double? = nil              // CTL (EWMA strainLoad, α=0.069)
+        var autonomicStress: Double? = nil          // EWMA of -hrvZ+rhrZ+rrZ
+        var sleepDebtMinutes: Double? = nil         // cumulative debt minutes, 0..600
+        var readinessCapacity: Double? = nil        // 0..1 hidden modulator
+        var strainTolerance: Double? = nil          // 0.5..1.5
+        var illnessFlag: Bool? = nil
         var hrvVersion: Int
         var strainVersion: Int
         var sleepVersion: Int
         var recoveryVersion: Int = 0
+        var physiologyVersion: Int = 0
+        var respiratoryRateVersion: Int = 0
     }
 
     struct AlgorithmVersion: Codable, Sendable {
@@ -88,13 +100,46 @@ actor DailyMetricsStore {
     func datesNeedingRecompute(metric: String, below version: Int) -> [String] {
         metrics.filter { m in
             switch metric {
-            case "hrv":      return m.hrvVersion      < version
-            case "strain":   return m.strainVersion   < version
-            case "sleep":    return m.sleepVersion    < version
-            case "recovery": return m.recoveryVersion < version
-            default:         return false
+            case "hrv":             return m.hrvVersion             < version
+            case "strain":          return m.strainVersion          < version
+            case "sleep":           return m.sleepVersion           < version
+            case "recovery":        return m.recoveryVersion        < version
+            case "physiology":      return m.physiologyVersion      < version
+            case "respiratoryRate": return m.respiratoryRateVersion < version
+            default:                return false
             }
         }.map(\.date)
+    }
+
+    /// Exponential weighted moving average + std, walking days backward from `asOf`.
+    /// `alpha` ≈ 2 / (N + 1) where N is the equivalent SMA window. Suggested values:
+    ///   HRV α≈0.033 (≈60d), RHR α≈0.022 (≈90d), RR α≈0.033, sleepMinutes α≈0.071 (≈28d).
+    /// Returns nil if fewer than 2 values present in the rolling buffer.
+    func ewmaBaseline(
+        _ extract: (DailyMetrics) -> Double?,
+        excluding excludingDate: String? = nil,
+        alpha: Double,
+        asOf: Date = Date()
+    ) -> (mean: Double, std: Double, count: Int)? {
+        let sorted = metrics
+            .filter { $0.date != excludingDate && isoToDate($0.date) < asOf }
+            .compactMap { m -> (date: Date, val: Double)? in
+                guard let v = extract(m), v.isFinite else { return nil }
+                return (isoToDate(m.date), v)
+            }
+            .sorted { $0.date < $1.date }   // chronological — older → newer
+        guard sorted.count >= 2 else { return nil }
+        var mean = sorted[0].val
+        var variance = 0.0
+        for i in 1..<sorted.count {
+            let x = sorted[i].val
+            let prevMean = mean
+            mean = alpha * x + (1 - alpha) * mean
+            // EWMA variance update (West 1979 style): track exp-weighted squared dev around running mean
+            let dev = x - prevMean
+            variance = (1 - alpha) * (variance + alpha * dev * dev)
+        }
+        return (mean, sqrt(max(0, variance)), sorted.count)
     }
 
     func rollingBaseline(
@@ -177,14 +222,29 @@ extension DailyMetricsStore.DailyMetrics {
         recoveryConfidence = try c.decodeIfPresent(Double.self,      forKey: .recoveryConfidence)
         sleepMidpointMin  = try c.decodeIfPresent(Int.self,          forKey: .sleepMidpointMin)
         recoveryComponents = try c.decodeIfPresent(RecoveryBreakdown.self, forKey: .recoveryComponents)
+        respiratoryRate       = try c.decodeIfPresent(Double.self, forKey: .respiratoryRate)
+        respiratoryConfidence = try c.decodeIfPresent(Double.self, forKey: .respiratoryConfidence)
+        acuteFatigue          = try c.decodeIfPresent(Double.self, forKey: .acuteFatigue)
+        chronicLoad           = try c.decodeIfPresent(Double.self, forKey: .chronicLoad)
+        autonomicStress       = try c.decodeIfPresent(Double.self, forKey: .autonomicStress)
+        sleepDebtMinutes      = try c.decodeIfPresent(Double.self, forKey: .sleepDebtMinutes)
+        readinessCapacity     = try c.decodeIfPresent(Double.self, forKey: .readinessCapacity)
+        strainTolerance       = try c.decodeIfPresent(Double.self, forKey: .strainTolerance)
+        illnessFlag           = try c.decodeIfPresent(Bool.self,   forKey: .illnessFlag)
         hrvVersion        = try c.decodeIfPresent(Int.self,          forKey: .hrvVersion)      ?? 0
         strainVersion     = try c.decodeIfPresent(Int.self,          forKey: .strainVersion)   ?? 0
         sleepVersion      = try c.decodeIfPresent(Int.self,          forKey: .sleepVersion)    ?? 0
         recoveryVersion   = try c.decodeIfPresent(Int.self,          forKey: .recoveryVersion) ?? 0
+        physiologyVersion = try c.decodeIfPresent(Int.self,          forKey: .physiologyVersion) ?? 0
+        respiratoryRateVersion = try c.decodeIfPresent(Int.self,     forKey: .respiratoryRateVersion) ?? 0
     }
 
     var isFinite: Bool {
-        let doubles: [Double?] = [rhr, hrvRmssd, hrvSdnn, strainScore, recoveryScore, circadianPenalty, recoveryConfidence]
+        let doubles: [Double?] = [
+            rhr, hrvRmssd, hrvSdnn, strainScore, recoveryScore, circadianPenalty, recoveryConfidence,
+            respiratoryRate, respiratoryConfidence, acuteFatigue, chronicLoad, autonomicStress,
+            sleepDebtMinutes, readinessCapacity, strainTolerance
+        ]
         guard doubles.compactMap({ $0 }).allSatisfy({ $0.isFinite }) else { return false }
         return recoveryComponents?.isFinite ?? true
     }

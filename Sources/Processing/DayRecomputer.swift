@@ -2,10 +2,12 @@ import Foundation
 import HealthKit
 
 enum AlgoVersions {
-    static let hrv      = 4
-    static let strain   = 3
-    static let sleep    = 12  // RMSSD-based stage classifier (REM/DEEP confirmed by HRV)
-    static let recovery = 18  // bio day = wake calendar date (no noon shift); restored relevantKeys filter
+    static let hrv             = 5   // Phase 2: confidence-shrunk z, EWMA baseline
+    static let strain          = 4   // Phase 2: logistic (rawAccum→strain) replaces linear
+    static let sleep           = 12  // RMSSD-based stage classifier (REM/DEEP confirmed by HRV)
+    static let recovery        = 19  // Phase 2: no strain in autonomic; RR + capacity + illness modulation
+    static let physiology      = 1   // Phase 2: ATL/CTL/autonomicStress/sleepDebt/capacity hidden state
+    static let respiratoryRate = 1   // Phase 2: sleep-window RSA mean RR
 }
 
 final class DayRecomputer: @unchecked Sendable {
@@ -107,7 +109,6 @@ final class DayRecomputer: @unchecked Sendable {
         guard hrSamples.count >= 2 else { return 0 }
         let boundaries = [0.50, 0.60, 0.70, 0.80, 0.90].map { Int(Double(maxHR) * $0) }
         let weights    = [0.10, 0.50, 1.50, 4.00, 8.00]
-        let maxStrain: Double = 11.0
         let maxGapSec  = 120.0
         var accumulated = 0.0
         let firstZone = zoneIndex(bpm: hrSamples[0].bpm, boundaries: boundaries)
@@ -117,7 +118,9 @@ final class DayRecomputer: @unchecked Sendable {
             let zone = zoneIndex(bpm: hrSamples[i].bpm, boundaries: boundaries)
             accumulated += weights[zone] * (gap / 3600.0)
         }
-        return min(max((accumulated / maxStrain) * 21.0, 0), 21)
+        // Phase 2: logistic mapping. Inflection at rawAccum=12 → strain 10.5.
+        // Higher strain levels exponentially harder to accumulate at the tail.
+        return PhysiologicalDynamics.nonlinearStrain(rawAccum: accumulated)
     }
 
     private func zoneIndex(bpm: Int, boundaries: [Int]) -> Int {
@@ -180,9 +183,21 @@ final class DayRecomputer: @unchecked Sendable {
 
     // MARK: - Orchestrator
 
+    /// Optional callback fired once per bio-day with newly computed hidden state.
+    /// Used by RecomputeQueue → PhysiologicalStateStore to propagate to @MainActor UI.
+    typealias ScoresUpdate = @Sendable (
+        _ bioKey: String,
+        _ readinessCapacity: Double,
+        _ acuteFatigue: Double,
+        _ chronicLoad: Double,
+        _ sleepDebt: Double,
+        _ autonomicStress: Double
+    ) async -> Void
+
     func recomputeDay(date: Date, rawStore: RawDataStore, dailyStore: DailyMetricsStore,
                                healthKit: HealthKitWriter? = nil, featureCache: FeatureCache? = nil,
-                               snapshotStore: SnapshotStore? = nil) async {
+                               snapshotStore: SnapshotStore? = nil,
+                               onScoresUpdated: ScoresUpdate? = nil) async {
         await rawStore.flush()
         let hr = await rawStore.loadHR(for: date)
         let rr = await rawStore.loadRR(for: date)
@@ -192,14 +207,12 @@ final class DayRecomputer: @unchecked Sendable {
         let userAge   = storedAge > 0 ? max(10, min(100, storedAge)) : 35
         let maxHR     = 220 - userAge
         let rawStrain  = computeStrain(hrSamples: hr, maxHR: maxHR)
-        // Coverage = number of distinct minute buckets with at least one HR sample.
-        // Robust to sub-1Hz streaming and to in-progress days (don't divide by 24h).
-        // Need ≥ 6h of coverage to trust strain — below that, strap was offline
-        // most of day and an artificially-low strain would falsely boost recovery.
+        // Need ≥ 2h coverage to publish strain — below that, strap mostly off.
+        // 2h shows meaningful accumulation by mid-morning (6h was too conservative).
         var minutesWithHR = Set<Int>()
         for s in hr { minutesWithHR.insert(s.timestamp / 60) }
         let coveredMinutes = minutesWithHR.count
-        let strain: Double? = (rawStrain.isFinite && rawStrain > 0 && coveredMinutes >= 360) ? rawStrain : nil
+        let strain: Double? = (rawStrain.isFinite && rawStrain > 0 && coveredMinutes >= 120) ? rawStrain : nil
 
         // Feed prev day + current day HR for wider sleep detection (catches post-midnight + daytime)
         var cal = Calendar(identifier: .gregorian)
@@ -257,7 +270,8 @@ final class DayRecomputer: @unchecked Sendable {
             let cls = classifier.classify(session: session, circadian: circadian)
             classifications.append(cls)
             let midMin = midpointMinutes(from: session)
-            circadian.recordSession(session: session, localMidpointMin: midMin)
+            // Type-gated: only main + delayed-main pollute the circadian baseline.
+            circadian.recordSession(session: session, type: cls.type, localMidpointMin: midMin)
         }
 
         let assignments = bioAssigner.assign(sessions: allSessions, classifications: classifications)
@@ -269,15 +283,41 @@ final class DayRecomputer: @unchecked Sendable {
         let hrvSdnn = calDayFullHRV?.sdnn
 
         let allMetrics = await dailyStore.loadAll()
-        let hrvBaseRaw    = await dailyStore.rollingBaseline({ $0.hrvRmssd },                      excluding: calKey)
-        let rhrBaseRaw    = await dailyStore.rollingBaseline({ $0.rhr },                           excluding: calKey)
+        // Phase 2: EWMA baselines for autonomic metrics replace rolling mean/std.
+        // Sleep baseline remains rolling median (compatible with SleepNeedCalculator).
+        let hrvBaseRaw    = await dailyStore.ewmaBaseline({ $0.hrvRmssd },        excluding: calKey, alpha: 0.033)
+        let rhrBaseRaw    = await dailyStore.ewmaBaseline({ $0.rhr },             excluding: calKey, alpha: 0.022)
         let sleepBaseRaw  = await dailyStore.rollingBaseline({ $0.sleepMinutes.map(Double.init) }, excluding: calKey)
-        let strainBaseRaw = await dailyStore.rollingBaseline({ $0.strainScore },                   excluding: calKey)
+        let strainBaseRaw = await dailyStore.ewmaBaseline({ $0.strainScore },     excluding: calKey, alpha: 0.069)
+        let rrBaseRaw     = await dailyStore.ewmaBaseline({ $0.respiratoryRate }, excluding: calKey, alpha: 0.033)
 
         let hrvBase    = blendBaseline(personal: hrvBaseRaw,    population: EnhancedRecoveryScore.popHRV)
         let rhrBase    = blendBaseline(personal: rhrBaseRaw,    population: EnhancedRecoveryScore.popRHR)
         let sleepBase  = blendBaseline(personal: sleepBaseRaw,  population: EnhancedRecoveryScore.popSleep)
         let strainBase = blendBaseline(personal: strainBaseRaw, population: EnhancedRecoveryScore.popStrain)
+        let rrBase     = blendBaseline(personal: rrBaseRaw,     population: EnhancedRecoveryScore.popRR)
+
+        // Phase 2: sleep-window mean respiratory rate via RSA autocorrelation.
+        let (dailyRR, rrConfidence) = RespiratoryAggregator.meanRRDuringSleep(
+            rrSamples: rrAll,
+            sleepSessions: allSessions
+        )
+
+        // Phase 2: signal quality from HR/RR sample density + RR availability.
+        let hrHistorical = hr.map {
+            HistoricalSample(
+                timestamp: Date(timeIntervalSince1970: Double($0.timestamp)),
+                heartRate: $0.bpm,
+                accelerometer: nil,
+                rrIntervals: nil
+            )
+        }
+        let signalProcessor = SignalProcessor()
+        let sqHR = signalProcessor.signalQuality(hrHistorical)
+        // Warmup damp: <14 days of stored history → reduce confidence proportionally.
+        let daysObserved = allMetrics.count
+        let warmupFactor = min(1.0, Double(daysObserved) / 14.0)
+        let baseConf = max(0.2, sqHR) * (0.5 + 0.5 * warmupFactor)
 
         let need = SleepNeedCalculator().compute(for: date, dailyMetrics: allMetrics, sleepSessions: allSessions)
         print("[SleepNeed] date=\(calKey) baseline=\(need.baselineMinutes) adj=\(need.strainAdjMinutes) debt=\(need.debtMinutes) napcredit=\(need.napCreditMinutes) total=\(need.totalMinutes)")
@@ -376,6 +416,83 @@ final class DayRecomputer: @unchecked Sendable {
             let sleepBasePersonalized: (mean: Double, std: Double) =
                 (mean: Double(need.totalMinutes), std: sleepBase.std)
 
+            // ---------- Phase 2 hidden-state pipeline ----------
+            // Look up previous bio-day's hidden state to seed the EWMA chain.
+            let prevBioKey = isoKey(daysBefore: bioKey, by: 1)
+            let prevMetrics = allMetrics.first { $0.date == prevBioKey }
+            let prev = PhysiologicalDynamics.Prev(
+                acuteFatigue:      prevMetrics?.acuteFatigue      ?? PhysiologicalDynamics.seedAcuteFatigue,
+                chronicLoad:       prevMetrics?.chronicLoad       ?? PhysiologicalDynamics.seedChronicLoad,
+                autonomicStress:   prevMetrics?.autonomicStress   ?? PhysiologicalDynamics.seedAutonomicStress,
+                sleepDebt:         prevMetrics?.sleepDebtMinutes ?? PhysiologicalDynamics.seedSleepDebt,
+                readinessCapacity: prevMetrics?.readinessCapacity ?? PhysiologicalDynamics.seedReadinessCapacity
+            )
+
+            // Confidence per metric. RR confidence comes from RespiratoryAggregator; gated by
+            // signal quality + warmup so cold-start days don't move state by full delta.
+            let confHRV: Double = bioHRV != nil ? baseConf : 0
+            let confRHR: Double = bioRHR != nil ? baseConf : 0
+            let confRR:  Double = dailyRR != nil ? baseConf * rrConfidence : 0
+            let minConf = min(
+                confHRV.isFinite && confHRV > 0 ? confHRV : 1.0,
+                confRHR.isFinite && confRHR > 0 ? confRHR : 1.0,
+                confRR.isFinite  && confRR  > 0 ? confRR  : 1.0
+            )
+
+            // Z-scores for the autonomic chain (consumed by stress + composite alike).
+            func zScore(_ v: Double?, _ b: (mean: Double, std: Double)) -> Double {
+                guard let v else { return 0 }
+                guard b.std > 1e-6 else { return 0 }
+                return max(-3.0, min(3.0, (v - b.mean) / b.std))
+            }
+            let hrvZ = zScore(bioHRV, hrvBase)
+            let rhrZ = zScore(bioRHR, rhrBase)
+            let rrZ  = zScore(dailyRR, rrBase)
+
+            let hrvZ_eff = hrvZ * confHRV
+            let rhrZ_eff = rhrZ * confRHR
+            let rrZ_eff  = rrZ  * confRR
+
+            // Illness flag: today RR > +2σ AND yesterday RR > +2σ, both with conf > 0.5.
+            // Clears when today rrZ < 1 (single-day clear path — stricter "2 days < 1" handled by
+            // the latch only re-arming on the gate above).
+            let yesterdayRrZ      = prevMetrics?.respiratoryRate.map { zScore($0, rrBase) } ?? 0
+            let yesterdayRrConf   = prevMetrics?.respiratoryConfidence ?? 0
+            let yesterdayIllness  = prevMetrics?.illnessFlag ?? false
+            let illnessTrigger    = rrZ > 2.0 && confRR > 0.5 && yesterdayRrZ > 2.0 && yesterdayRrConf > 0.5
+            let illnessHoldClear  = rrZ < 1.0 && yesterdayRrZ < 1.0
+            let illnessFlag       = illnessTrigger || (yesterdayIllness && !illnessHoldClear)
+
+            // Strain → fatigue chain. Logistic strain already produced upstream; tolerance scales.
+            let tolerance = PhysiologicalDynamics.strainTolerance(chronicLoad: prev.chronicLoad)
+            let strainLoadInput: Double? = strain.map { $0 / tolerance }
+            let atlTarget = PhysiologicalDynamics.acuteFatigue(strainLoad: strainLoadInput, prev: prev)
+            let ctlTarget = PhysiologicalDynamics.chronicLoad(strainLoad: strainLoadInput, prev: prev)
+            let autonomicStressTarget = PhysiologicalDynamics.autonomicStress(
+                hrvZ_eff: hrvZ_eff, rhrZ_eff: rhrZ_eff, rrZ_eff: rrZ_eff, prev: prev
+            )
+            let sleepDebtMinTarget = PhysiologicalDynamics.sleepDebt(
+                sleepNeedMin:   need.totalMinutes,
+                sleepActualMin: totalSleepMin,
+                prev: prev
+            )
+            let capacityTarget = PhysiologicalDynamics.readinessCapacity(
+                acuteFatigue: atlTarget,
+                chronicLoad: ctlTarget,
+                autonomicStress: autonomicStressTarget,
+                sleepDebt: sleepDebtMinTarget,
+                illnessFlag: illnessFlag,
+                prev: prev
+            )
+
+            // Confidence-damp every state delta so noisy days don't lurch state.
+            let acuteFatigueNext      = PhysiologicalDynamics.confidenceDamp(prev: prev.acuteFatigue,      next: atlTarget,             minConfidence: minConf)
+            let chronicLoadNext       = PhysiologicalDynamics.confidenceDamp(prev: prev.chronicLoad,       next: ctlTarget,             minConfidence: minConf)
+            let autonomicStressNext   = PhysiologicalDynamics.confidenceDamp(prev: prev.autonomicStress,   next: autonomicStressTarget, minConfidence: minConf)
+            let sleepDebtMinNext      = PhysiologicalDynamics.confidenceDamp(prev: prev.sleepDebt,         next: sleepDebtMinTarget,    minConfidence: minConf)
+            let readinessCapacityNext = PhysiologicalDynamics.confidenceDamp(prev: prev.readinessCapacity, next: capacityTarget,        minConfidence: minConf)
+            let sleepDebtHoursNext    = sleepDebtMinNext / 60.0
+
             let breakdown = EnhancedRecoveryScore.compute(
                 hrv: bioHRV,
                 rhr: bioRHR,
@@ -394,7 +511,14 @@ final class DayRecomputer: @unchecked Sendable {
                 rhrBaseline: rhrBase,
                 sleepBaseline: sleepBasePersonalized,
                 strainBaseline: strainBase,
-                biologicalDateKey: bioKey
+                biologicalDateKey: bioKey,
+                respiratoryRate: dailyRR,
+                respiratoryBaseline: rrBase,
+                confHRV: confHRV,
+                confRHR: confRHR,
+                confRR: confRR,
+                readinessCapacity: readinessCapacityNext,
+                illnessFlag: illnessFlag
             )
 
             let sleepMidMin = primarySession.map { midpointMinutes(from: $0) }
@@ -416,35 +540,45 @@ final class DayRecomputer: @unchecked Sendable {
                 recoveryConfidence: breakdown.confidence,
                 sleepMidpointMin: sleepMidMin,
                 recoveryComponents: breakdown,
-                hrvVersion:       AlgoVersions.hrv,
-                strainVersion:    AlgoVersions.strain,
-                sleepVersion:     AlgoVersions.sleep,
-                recoveryVersion:  AlgoVersions.recovery
+                respiratoryRate:       dailyRR,
+                respiratoryConfidence: rrConfidence,
+                acuteFatigue:          acuteFatigueNext,
+                chronicLoad:           chronicLoadNext,
+                autonomicStress:       autonomicStressNext,
+                sleepDebtMinutes:      sleepDebtMinNext,
+                readinessCapacity:     readinessCapacityNext,
+                strainTolerance:       tolerance,
+                illnessFlag:           illnessFlag,
+                hrvVersion:            AlgoVersions.hrv,
+                strainVersion:         AlgoVersions.strain,
+                sleepVersion:          AlgoVersions.sleep,
+                recoveryVersion:       AlgoVersions.recovery,
+                physiologyVersion:     AlgoVersions.physiology,
+                respiratoryRateVersion: AlgoVersions.respiratoryRate
             ))
+
+            // Propagate hidden state to PhysiologicalStateStore → UI.
+            if let cb = onScoresUpdated {
+                await cb(bioKey, readinessCapacityNext, acuteFatigueNext, chronicLoadNext, sleepDebtHoursNext, autonomicStressNext)
+            }
 
             // Cache derived features so the next recompute for this date can skip clean subsystems.
             if let cache = featureCache {
-                let processor = SignalProcessor()
                 let now = Date()
                 var features = FeatureCache.CachedFeatures(dirtyFlags: [], computedAt: now)
-                if let hrv = bioHRV {
-                    let delta = hrvBase.std > 0 ? (hrv - hrvBase.mean) / hrvBase.std : 0
-                    features.hrvDeviation   = Metric(value: delta, confidence: 1.0, sampleCount: 1, computedAt: now)
-                    let zScore = hrv > 0 ? (hrv - hrvBase.mean) / max(1, hrvBase.std) : 0
-                    features.autonomicStress = Metric(value: -zScore, confidence: 1.0, sampleCount: 1, computedAt: now)
-                }
-                if let rhr = bioRHR {
-                    let delta = rhrBase.std > 0 ? (rhr - rhrBase.mean) / rhrBase.std : 0
-                    features.rhrDeviation = Metric(value: delta, confidence: 1.0, sampleCount: 1, computedAt: now)
-                }
-                if let s = strain {
-                    features.acuteFatigue = Metric(value: s, confidence: 1.0, sampleCount: 1, computedAt: now)
-                }
-                let sleepDebtHours = max(0, Double(need.totalMinutes - totalSleepMin)) / 60.0
-                features.sleepDebt = Metric(value: sleepDebtHours, confidence: totalSleepMin > 0 ? 1.0 : 0.3,
-                                            sampleCount: 1, computedAt: now)
-                features.sleepConsistency = Metric(value: consistencyScore, confidence: 1.0, sampleCount: 1, computedAt: now)
-                _ = processor  // suppress unused warning; processor available for future signal quality calls
+                features.hrvDeviation         = Metric(value: hrvZ, confidence: confHRV, sampleCount: 1, computedAt: now)
+                features.rhrDeviation         = Metric(value: rhrZ, confidence: confRHR, sampleCount: 1, computedAt: now)
+                features.respiratoryDeviation = Metric(value: rrZ,  confidence: confRR,  sampleCount: 1, computedAt: now)
+                features.acuteFatigue         = Metric(value: acuteFatigueNext,    confidence: minConf, sampleCount: 1, computedAt: now)
+                features.chronicLoad          = Metric(value: chronicLoadNext,     confidence: minConf, sampleCount: 1, computedAt: now)
+                features.autonomicStress      = Metric(value: autonomicStressNext, confidence: minConf, sampleCount: 1, computedAt: now)
+                features.readinessCapacity    = Metric(value: readinessCapacityNext, confidence: minConf, sampleCount: 1, computedAt: now)
+                features.strainTolerance      = Metric(value: tolerance,           confidence: 1.0,     sampleCount: 1, computedAt: now)
+                features.sleepDebt            = Metric(value: sleepDebtHoursNext,
+                                                       confidence: totalSleepMin > 0 ? 1.0 : 0.3,
+                                                       sampleCount: 1, computedAt: now)
+                features.sleepConsistency     = Metric(value: consistencyScore, confidence: 1.0, sampleCount: 1, computedAt: now)
+                features.illnessFlag          = illnessFlag
                 await cache.upsert(features, for: bioKey)
             }
 
@@ -458,7 +592,7 @@ final class DayRecomputer: @unchecked Sendable {
                     strain:           strain,
                     sleepMinutes:     totalSleepMin > 0 ? totalSleepMin : nil,
                     sleepNeedMinutes: need.totalMinutes,
-                    sleepDebt:        max(0, Double(need.totalMinutes - totalSleepMin)) / 60.0,
+                    sleepDebt:        sleepDebtHoursNext,
                     hrvRMSSD:         bioHRV,
                     rhr:              bioRHR,
                     algorithmVersion: AlgoVersions.recovery,
@@ -488,8 +622,14 @@ final class DayRecomputer: @unchecked Sendable {
                     recoveryScore: nil, biologicalDate: nil, circadianPenalty: nil,
                     sleepTypeCode: nil, recoveryConfidence: nil, sleepMidpointMin: nil,
                     recoveryComponents: nil,
+                    respiratoryRate: nil, respiratoryConfidence: nil,
+                    acuteFatigue: nil, chronicLoad: nil, autonomicStress: nil,
+                    sleepDebtMinutes: nil, readinessCapacity: nil, strainTolerance: nil,
+                    illnessFlag: nil,
                     hrvVersion: AlgoVersions.hrv, strainVersion: AlgoVersions.strain,
-                    sleepVersion: AlgoVersions.sleep, recoveryVersion: AlgoVersions.recovery
+                    sleepVersion: AlgoVersions.sleep, recoveryVersion: AlgoVersions.recovery,
+                    physiologyVersion: AlgoVersions.physiology,
+                    respiratoryRateVersion: AlgoVersions.respiratoryRate
                 ))
             }
         }
@@ -530,6 +670,20 @@ final class DayRecomputer: @unchecked Sendable {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC")!
         let c = cal.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
+    }
+
+    /// Convert an ISO date key (yyyy-MM-dd) to the key N days earlier, UTC.
+    private func isoKey(daysBefore key: String, by days: Int) -> String {
+        let parts = key.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return key }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        var dc = DateComponents()
+        dc.year = parts[0]; dc.month = parts[1]; dc.day = parts[2]
+        guard let d = cal.date(from: dc),
+              let prev = cal.date(byAdding: .day, value: -days, to: d) else { return key }
+        let c = cal.dateComponents([.year, .month, .day], from: prev)
         return String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
     }
 }

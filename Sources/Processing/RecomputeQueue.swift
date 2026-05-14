@@ -6,6 +6,7 @@ import HealthKit
 actor RecomputeQueue {
 
     private var pending:       Set<String> = []  // ISO date strings "2025-04-27"
+    private var processed:     Set<String> = []  // dates already drained this session
     private var isRunning:     Bool = false
     private var rawStore:      RawDataStore?
     private var dailyStore:    DailyMetricsStore?
@@ -14,12 +15,21 @@ actor RecomputeQueue {
     private var snapshotStore: SnapshotStore?
     private let recomputer     = DayRecomputer()
     private var onComplete: [@Sendable () async -> Void] = []
+    private var onScoresUpdated: DayRecomputer.ScoresUpdate?
 
-    /// Inject dependencies for recompute calls.
-    func configure(healthKit: HealthKitWriter, featureCache: FeatureCache? = nil, snapshotStore: SnapshotStore? = nil) {
-        self.healthKit     = healthKit
-        self.featureCache  = featureCache
-        self.snapshotStore = snapshotStore
+    /// Inject dependencies for recompute calls. `onScoresUpdated` fires per bio-day with
+    /// newly computed hidden physiological state; PhysiologicalStateStore wires this to
+    /// `updateScores` so the @MainActor UI sees fresh capacity/ATL/CTL/debt/stress.
+    func configure(
+        healthKit: HealthKitWriter,
+        featureCache: FeatureCache? = nil,
+        snapshotStore: SnapshotStore? = nil,
+        onScoresUpdated: DayRecomputer.ScoresUpdate? = nil
+    ) {
+        self.healthKit       = healthKit
+        self.featureCache    = featureCache
+        self.snapshotStore   = snapshotStore
+        if let cb = onScoresUpdated { self.onScoresUpdated = cb }
     }
 
     /// Enqueue one or more dates. Starts drain loop if not already running.
@@ -33,7 +43,24 @@ actor RecomputeQueue {
         self.rawStore   = rawStore
         self.dailyStore = dailyStore
         if let c = completion { self.onComplete.append(c) }
-        for date in dates { pending.insert(isoDate(for: date)) }
+        var rebuiltCount = 0
+        for date in dates {
+            let key = isoDate(for: date)
+            pending.insert(key)
+            // Hidden-state prev-chain repair: if this date predates any already-processed
+            // date, those downstream rows ran without correct prev physiology. Push them
+            // back so ATL/CTL/capacity/sleepDebt reconstruct in order.
+            if let earliest = processed.min(), key < earliest {
+                for p in processed where p >= key {
+                    pending.insert(p)
+                    rebuiltCount += 1
+                }
+                processed.subtract(pending)
+            }
+        }
+        if rebuiltCount > 0 {
+            print("[Recompute] prev-chain repair: re-enqueued \(rebuiltCount) downstream date(s)")
+        }
         print("[Recompute] queued \(dates.count) date(s) — pending=\(pending.count)")
         guard !isRunning else { return }
         isRunning = true
@@ -46,12 +73,17 @@ actor RecomputeQueue {
 
     private func drain() async {
         while !pending.isEmpty {
-            let key = pending.removeFirst()
+            // Drain ascending so hidden-state prev-chain (ATL/CTL/capacity/sleepDebt)
+            // reconstructs forward through history. Random Set order would corrupt
+            // EWMA continuity for backfills > 1 day.
+            let key = pending.sorted().first!
+            pending.remove(key)
             guard let date = parseISODate(key),
                   let raw = rawStore,
                   let daily = dailyStore else { continue }
             print("[Recompute] processing \(key)")
-            await recomputer.recomputeDay(date: date, rawStore: raw, dailyStore: daily, healthKit: healthKit, featureCache: featureCache, snapshotStore: snapshotStore)
+            await recomputer.recomputeDay(date: date, rawStore: raw, dailyStore: daily, healthKit: healthKit, featureCache: featureCache, snapshotStore: snapshotStore, onScoresUpdated: onScoresUpdated)
+            processed.insert(key)
         }
         isRunning = false
         print("[RecomputeQueue] drain complete")

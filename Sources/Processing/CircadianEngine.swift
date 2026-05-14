@@ -34,6 +34,14 @@ final class CircadianEngine {
         recomputeBaseline()
     }
 
+    /// Type-gated overload. Only main + delayed-main sessions contribute to the
+    /// habitual midpoint baseline. Naps and compensatory sleep have midpoints in
+    /// the wrong window and would saturate the penalty to ~1.0 on real sleep.
+    func recordSession(session: SleepSession, type: SleepEpisodeType, localMidpointMin: Int) {
+        guard type == .mainSleep || type == .delayedMainSleep else { return }
+        recordSession(session: session, localMidpointMin: localMidpointMin)
+    }
+
     func compute(for session: SleepSession) -> CircadianMetrics {
         let localMid = midpointMinutes(from: session)
         let habitual = habitualMidpoint ?? localMid

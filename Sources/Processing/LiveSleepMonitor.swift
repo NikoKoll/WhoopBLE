@@ -99,11 +99,11 @@ final class LiveSleepMonitor {
                     briefWakeTotalSecs += dur
                     briefWakeCount += 1
                     let durMins = Int(dur / 60)
-                    print("[Sleep] brief wake absorbed (under 10min threshold) duration=\(durMins)m interruption_count=\(briefWakeCount)")
+                    print("[Sleep] brief wake absorbed (under 30min threshold) duration=\(durMins)m interruption_count=\(briefWakeCount)")
                 }
                 briefWakeStart = nil
                 state = .sleeping
-            } else if let bws = briefWakeStart, now.timeIntervalSince(bws) >= 600 {
+            } else if let bws = briefWakeStart, now.timeIntervalSince(bws) >= 1800 {
                 if let onset = sleepOnset {
                     let sessionDurSecs = Int(bws.timeIntervalSince(onset))
                     let h = sessionDurSecs / 3600; let m = (sessionDurSecs % 3600) / 60
